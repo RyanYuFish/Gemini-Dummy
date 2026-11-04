@@ -290,7 +290,8 @@ class BootPreparation {
   static String _qemuMissing() =>
       '未找到自建 QEMU（系统 QEMU 无 sunplus-sp8368 机器模型，不回落）。\n'
       '构建：python3 ${LabPaths.lab}/tools/build_model.py\n'
-      '产物：${LabPaths.customQemu}';
+      '产物：${LabPaths.customQemu}\n'
+      '仓库位置不同可指定 AE5I_PROJECT_ROOT 或 AE5I_QEMU_BIN';
 
   static String _spvdMissing() =>
       '未找到 SPVD 虚拟硬盘。先用 NAND dump 生成一个：\n${LabPaths.spvdHint}\n'

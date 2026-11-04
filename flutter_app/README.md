@@ -15,7 +15,7 @@ python3 Gemini-Dummy/tools/prepare_software_display.py
 
 ```bash
 # FLUTTER 指向所用 SDK 的 bin/flutter（本仓库不再内置 SDK）
-export FLUTTER=/Users/ryanfish/fvm/versions/custom_zeeho/bin/flutter
+export FLUTTER="${FLUTTER:-$HOME/fvm/versions/custom_zeeho/bin/flutter}"
 cd Gemini-Dummy/flutter_app
 "$FLUTTER" run -d macos
 ```
@@ -23,17 +23,17 @@ cd Gemini-Dummy/flutter_app
 Release 构建：
 
 ```bash
-HOME=/tmp FLUTTER_SUPPRESS_ANALYTICS=true "$FLUTTER" build macos --release
+FLUTTER_SUPPRESS_ANALYTICS=true "$FLUTTER" build macos --release
 open build/macos/Build/Products/Release/ae5i_emu.app
 ```
 
-2026-11-02 验收版已构建：`build/macos/Build/Products/Release/ae5i_emu.app`（Universal arm64 + x86_64）。应用按本机绝对路径寻找自建 QEMU、SPVD 和原厂动画转换资源；请在项目工作区环境中运行。
+2026-11-05 重建版：`build/macos/Build/Products/Release/ae5i_emu.app`。应用**不再写死任何绝对路径**：从 app 自身位置 / 脚本位置 / 当前目录逐级向上探测仓库根（识别 `qemu-src/`、`tools/`、`flutter_app/`），再据此定位自建 QEMU、SPVD 和原厂动画资源；目录改名或移动仓库都不会再出现「找不到 QEMU」。
 
-需要本地 Flutter、Xcode、`unsquashfs`、`mksquashfs` 和 `Gemini-Dummy/images/ae5i.spvd`。软件显示镜像仅用于仿真。可通过 `AE5I_QEMU_BIN` 和 `AE5I_SPVD` 覆盖默认路径。
+需要本地 Flutter、Xcode、`unsquashfs`、`mksquashfs` 和 `Gemini-Dummy/images/ae5i.spvd`。软件显示镜像仅用于仿真。可用环境变量覆盖：`AE5I_PROJECT_ROOT`（仓库根或其上级工作区）、`AE5I_QEMU_BIN`、`AE5I_SPVD`、`AE5I_BOOT_ANIM`。
 
-> Flutter SDK 不再内置于本仓库，现用 `/Users/ryanfish/fvm/versions/custom_zeeho`（Flutter 3.47.9 / Dart 3.13.7，见 `docs/EMULATION.md` §26.4）。需同时设 `HOME=/tmp` 与 `FLUTTER_SUPPRESS_ANALYTICS=true`，让 pub 缓存和 analytics 写 `/tmp`。
+> ⚠️ **不要设 `HOME=/tmp`**：它会让 `.dart_tool/package_config.json` 指向 `/tmp/.pub-cache`，缓存被清理后 Flutter framework 编译报 `meta.dart: No such file or directory` / `Matrix4 isn't a type`。若已误设过，先跑一次 `flutter pub get --offline`（真实 HOME）重建包解析再构建。
 >
-> ⚠️ 该 SDK 在 home 目录，**沙箱内**跑 `test`/`build` 会因 unlink `bin/cache/engine.stamp.tmp.*` 被拒；需让命令获得沙箱放行，或把 SDK 放回工作区内。`flutter --version` 不写 stamp，能过不代表没限制。
+> Flutter SDK 不再内置于本仓库，本机用 `$HOME/fvm/versions/custom_zeeho`（Flutter 3.47.9 / Dart 3.13.7，见 `docs/EMULATION.md` §26.4）。SDK 在 home 目录时，沙箱内跑 `test`/`build` 可能因 unlink `bin/cache/engine.stamp.tmp.*` 被拒；需让命令获得沙箱放行。`flutter --version` 不写 stamp，能过不代表没限制。
 
 ## 整车流程仿真
 
@@ -58,8 +58,8 @@ open build/macos/Build/Products/Release/ae5i_emu.app
 测试：
 
 ```bash
-HOME=/tmp FLUTTER_SUPPRESS_ANALYTICS=true "$FLUTTER" test
+FLUTTER_SUPPRESS_ANALYTICS=true "$FLUTTER" test
 # 端到端（真实 QEMU，约 2–4 分钟）
-HOME=/tmp FLUTTER_SUPPRESS_ANALYTICS=true "$FLUTTER" test test/boot_integration.dart
+FLUTTER_SUPPRESS_ANALYTICS=true "$FLUTTER" test test/boot_integration.dart
 ```
 
