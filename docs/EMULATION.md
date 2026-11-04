@@ -3675,3 +3675,96 @@ TC-off 图标，再喂 `ABS_off` 会变成两个图标叠加（且新图标被�
 
 `ambTemperature` 喂 25（℃）**在 P 档主界面不上屏**（实车照底栏右侧有 `25℃`，
 我们这边只出时钟）⇒ 该 widget 的显示条件还没解，prop 已经喂对了。
+
+## 43. Flutter app 黑屏根因与修复：把 §41 链路搬进客户端（2026-11-05）
+
+### 43.1 现象与根因
+
+11-05 重建的 `ae5i_emu.app` 上电后画面依旧全黑，没有蓝绿背景墙 / 右侧大 P /
+整车 / 进场动画。排查后确认**不是模型问题，也不是路径问题**（上一轮已修好
+「找不到 QEMU」），而是 **app 里的 MCU 模拟从未升级到 §41 的逆向成果**：
+
+| | `run_ui.sh` + `tools/dash_up.py`（已验收） | Flutter app（修复前） |
+|---|---|---|
+| CFCP 连接时机 | QEMU 起来即连 | 上电即连（仅 ACK，**不发数据**） |
+| 数据启动时机 | 立即 pre-arm | **等用户手动解锁**才启动 |
+| 发的帧 | KL15 / RTC / 解锁通知 / vi1 / vi2 / vi3 / batt / ODO / trip / 心跳 | 11-02 旧基线：版本 / 握手 / 能力 / 状态 / `0x21709702` / 心跳 / 灯态 |
+| `KL15=0x99` | ✅ | ❌ → OSD 不点亮 |
+| `synchronization_status` | ✅ | ❌ → `slot_delayUpdateGear` 在 `0xa46b6` 直接 return |
+| `vehicle_info2.gear=1` | ✅ | ❌ → 场景机永远不去 `Animation_Pstart_init()` |
+| 三段式进场 | ✅ | ❌ |
+
+⇒ guest 属性表为空、App 停在黑屏 / 4.37% 非黑的待机统计页。源码注释当时甚至还
+写着「上行车辆信号帧格式未解出」，而 §41 早已把它全解出来了 —— 典型的
+「工具链成果没回流到产品代码」。
+
+### 43.2 修复
+
+新增 `flutter_app/lib/emu/dash_up.dart`（**纯 Dart、不依赖 Flutter**，便于 CI 验收），
+把 `dash_up.py` 完整移植：
+
+* `DashProp`：全部上行 prop id；
+* `DashTelemetry`：**MCU 遥测数据源**，所有上屏数值的唯一真值源
+  （默认 91% 电量 / 506.0 km / 28.7 Wh·km⁻¹ / 10.0 km / 3.5 Wh / ECO / P 挡 / 25℃），
+  由固件自己的 widget 渲染，本项目不合成任何像素；
+* 帧构造：`dashVi1Frame` / `dashVi2Frame` / `dashVi3Frame` / `dashBattFrame` /
+  `dashSyncFrame` / `dashOdoFrame` / `dashTripFrame` / `dashRtcFrame` /
+  `dashLampFrame` / `dashBootFrames` / `dashDataFrames` / `dashKeepFrames`；
+* `DashUpFeeder`：`preArm → boot → unlock → settle(20 拍 gear=0) →
+  enter(只写一次 gear=1) → hold(0.5 s 心跳 + 掉回待机自愈)` 状态机。
+
+`flutter_app/lib/emu/controller.dart` 的接入点：
+
+* `start()` 在 `_connectCfcpEarly()` 之后立刻 `_startDashUp()`，不再等用户解锁
+  （真车 MCU 与仪表同电源上电）；
+* 删掉旧 `_startGd32()` 基线帧与 1 Hz 旧心跳，避免两个数据源打架；
+* `_fireWake()` 只保留「解锁时重放 bootloader logo」，**不重复发基线、不重写挡位**；
+* ACK 改为直写 socket，**不排进 `_keyQueue`** —— 三段式进场会连续排几十帧数据，
+  ACK 若排队尾会被延迟数秒，guest 内核重传 3 次后丢弃属性帧；
+* `displayLit` 判定加入 `_clusterEntered`，让 UI 指示器诚实反映固件已点亮。
+
+环境变量保持 `SP_IPC_MODE` 不设（模型默认 0 = 按来源路由，优于 `run_ui.sh` 的 2），
+`SP_FB_NO_FLIPCOPY` 不设（§42 的翻页整页复制默认开启）。
+
+### 43.3 验证
+
+**帧字节一致性**：`tool/dash_up_check.dart --frames` 输出 18 帧 hex，与
+`tools/dash_up.py` 同顺序输出 `diff` 为空（boot 8 帧 + sync + vi1 + vi2×2 + vi3 +
+batt + odo + trip + 固定 RTC + lamp）。
+
+**端到端**（纯 Dart 起 QEMU + `DashUpFeeder`，与 app 完全相同的 `LaunchSpec`）：
+
+```
+$ dart run tool/dash_up_check.dart --duration 90 --out /tmp/check.ppm
+[12s] nonblack=59.61% teal=44.85%   ← enter 之后立刻进 P 档
+[90s] nonblack=59.62% teal=44.86%
+FINAL ... acks=128 rx=858 entered=true
+RESULT PASS
+```
+
+90 秒全程稳定在 59.5% / 44.8%，与 §41.5 手动 `dash_up.py` 的验收值
+（59.66~60.14% / 44.9~45.4%）一致，自愈未触发。导出帧人工核对：右侧茶青墙 +
+巨大 P + 银灰整车 + 顶部斜向绿光条 + 左列四项数据（10.0 km / 3.5 Wh /
+28.7 Wh·km⁻¹ / 506 km）+ 绿色地面 + 底栏（91% / 0km / 当前 RTC 时间），
+**无花屏、无重影、无文字叠加**。数值全部来自 `DashTelemetry`，时间跟随宿主机。
+验收帧：`artifacts/dash_app_pgear_verified.png`（模型导出的 PPM 仅做格式转换，
+像素未改，仍是固件自己画出来的画面）。
+
+进场动画采样（`enter` 后每 100 ms 的非黑占比）证明动画确实在播，不是直接
+跳到静态终帧：
+
+```
+4.0 4.0 47.6 50.0 52.8 53.4 57.8 58.6 59.6 59.5 59.6 → 稳定 59.6
+```
+
+### 43.4 工具与遗留
+
+* `flutter_app/tool/dash_up_check.dart`：`--frames` 字节回归 / 默认端到端验收 /
+  `--duration` / `--out`；`enter` 阶段每 100 ms 采样非黑占比，用来确认
+  `Animation_Pstart_init()` 的进场动画确实在播。
+* 仍保留 `SP_WAKE_FILE` 门控：用户手动解锁时模型会插播一段 bootloader logo。
+  它与 P 档进场动画是两套独立动画（前者模型重放、后者固件 Qt 场景机绘制），
+  上电自动进场不依赖它；若要让两段严格串行，可把 `LaunchSpec.wakeFile` 置空
+  改为上电即播 logo。
+* §42.6 的 PFC/DOV 背景层、§42.7 指示灯默认不喂、§42.8 环境温度不上屏，
+  这些已知限制不变。

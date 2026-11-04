@@ -14,6 +14,7 @@ import 'package:flutter/foundation.dart';
 
 import 'machine.dart';
 import 'cfcp.dart';
+import 'dash_up.dart';
 import 'gd32.dart';
 import 'keys.dart';
 import 'mcu.dart';
@@ -203,9 +204,15 @@ class QemuController {
   /// MCU 上电日志序列定时器（模拟 GD32 启动 / 认证轮询的串口输出）。
   Timer? _mcuTimer;
 
-  /// GD32 心跳定时器（CFCP 属性帧 0x21709521，约每秒一次）。
-  Timer? _gd32Heartbeat;
-  bool _gd32Started = false;
+  /// MCU 对端：按 EMULATION.md §41 三段式进场喂 KL15 / 解锁 / 挡位 / 全量
+  /// 车辆数据，让固件自己画出 P 档主界面。上电即启动，不再等用户解锁。
+  DashUpFeeder? _dashUp;
+
+  /// 进场序列已跑完（画面确实由固件点亮），供 displayLit 诚实指示。
+  bool _clusterEntered = false;
+
+  /// MCU 遥测数据源：所有上屏数值的唯一真值源，由固件渲染，不重绘。
+  final telemetry = DashTelemetry();
 
   bool _shutdownRequested = false;
   bool _shutdownCommandSent = false;
@@ -341,8 +348,9 @@ class QemuController {
         _emit(LogKind.app, '唤醒触发文件写入失败：$e');
       }
     }
-    // 车辆启动 = MCU 上线：开始向 ttyS1 上报 CFCP 属性帧（真机语义）。
-    _startGd32();
+    // MCU 对端已在上电时启动（真车 MCU 与仪表同电源上电），这里不重复
+    // 发基线帧、也不重写挡位：反复写 gear 会让 slot_delayUpdateGear 重摆顶部
+    // DRL/ECO，把图标叠成双份（EMULATION.md §41）。
   }
 
   /// 模拟 GD32 MCU 上电启动与各外设初始化，把代表性日志流进日志面板，
@@ -620,6 +628,11 @@ class QemuController {
       // 早连能收下 guest 开机期间推的属性帧并及时 ACK（否则这些帧会被内核
       // 重传 3 次后丢弃，见 _handleCfcpFrame 注释）。
       _connectCfcpEarly();
+      // ★ 上电即开始喂 MCU 数据：KL15 点亮 → 解锁通知 → 三段式进场 → P 档。
+      //   旧版本只在「用户解锁」后发 11-02 的旧基线帧（版本/握手/心跳），
+      //   既没有 KL15 也没有 synchronization_status / vehicle_info2，
+      //   固件因此一直停在黑屏 / 待机统计页。见 EMULATION.md §41。
+      _startDashUp();
       final errors = StringBuffer();
       proc.stdout.transform(const Utf8Decoder(allowMalformed: true)).listen((
         s,
@@ -813,9 +826,10 @@ class QemuController {
       }
       final painted = pixels == 0 ? 0.0 : nonzero / pixels;
       displayPaintedPct.value = painted;
-      // 仪表「点亮」= 车辆已启动（unlocked/ready）且画面非黑（含正在播开机动画）。
-      // 上电→MCU 启动→等待解锁这段，仪表保持黑屏待机，不算点亮。
-      if (vehicle.state.isAwake && (painted > 0.002 || animating.value)) {
+      // 仪表「点亮」= 用户已解锁，或 MCU 三段式进场已完成（固件自己画出了
+      // P 档主界面），且画面非黑。上电初期还没点亮时不误判。
+      if ((vehicle.state.isAwake || _clusterEntered) &&
+          (painted > 0.002 || animating.value)) {
         displayLit.value = true;
       }
 
@@ -867,7 +881,8 @@ class QemuController {
   /// 上电即尝试连上 CFCP（UART1 对端）。
   ///
   /// QEMU 的 chardev 是 `server=on,wait=off`，端口监听可能比本调用晚几百毫秒才就绪，
-  /// 所以带退避重试；失败不致命（解锁时 `_startGd32` 还会再连一次）。
+  /// 所以带退避重试；失败不致命（DashUpFeeder 的每帧发送经 `_cfcpSend` →
+  /// `_ensureCfcp` 也会自动补连）。
   void _connectCfcpEarly() {
     var attempt = 0;
     Future<void> tryOnce() async {
@@ -979,7 +994,16 @@ class QemuController {
     final cmd = frame.length > 6 ? frame[6] : -1;
     if (type != kCfcpTypeAck) {
       _cfcpAckSent++;
-      _cfcpSend(cfcpAckFrame());
+      // ACK 不排进 _keyQueue：三段式进场会连续排几十帧数据，若 ACK 排在队尾
+      // 会被延迟数秒，guest 内核重传 3 次后就把属性帧丢了
+      //（cfcp_ack_q_work_handl ... resend_times is 3）。整帧一次 add，
+      // 不会插进别的数据帧中间。
+      final socket = _cfcp;
+      if (socket != null) {
+        socket.add(cfcpAckFrame());
+      } else {
+        _cfcpSend(cfcpAckFrame());
+      }
     }
     // 对端推来的属性帧：记进属性表（SoC 侧广播的仪表状态）。
     final msg = cfcpParseProp(frame);
@@ -1081,50 +1105,61 @@ class QemuController {
     return _keyQueue;
   }
 
-  /// 解锁后启动「MCU 侧」链路角色。
+  /// 上电即启动 MCU 对端（真车 MCU 与仪表同电源上电，不等用户解锁）。
   ///
-  /// 发基线属性帧（版本/握手/能力/状态/档位/心跳）＋1 Hz 心跳。
+  /// 2026-11-05 修复：旧实现只在「用户解锁」后发 11-02 的基线帧
+  ///（版本/握手/能力/状态/旧档位/心跳），既没有 KL15=0x99，也没有
+  /// synchronization_status 解锁闸门和 vehicle_info2 挡位，所以固件一直
+  /// 停在黑屏 / 4.37% 非黑的待机统计页 —— 蓝绿背景、右侧大 P、整车和
+  /// 进场动画全都出不来。
   ///
-  /// ⚠ 语义（2026-11-02 实测，见 gd32.dart 文件头与 EMULATION.md §29）：
-  /// 这条属性通道是**双向镜像**的 —— 我们写的值 guest 会原样广播回来，
-  /// **去掉基线帧 guest 的属性表就是空的、什么都不广播**（已实测）。
-  /// 但**我们写属性不会改变集群渲染**（11 属性 × sub 0..4 共 55 组扫描，
-  /// framebuffer 变化恒为 0）⇒ 主表盘不由这条通道驱动。
-  /// 集群状态我们只能**观测**（[clusterState]），那边由面板键驱动。
-  void _startGd32() {
-    if (!running.value || _gd32Started) return;
-    _gd32Started = true;
-    for (final f in gd32BootFrames()) {
-      _cfcpSend(f, log: 'MCU → ${describeFrame(f)}');
-    }
-    for (final f in gd32StateFrames(mcu.state.value)) {
-      _cfcpSend(f, log: 'MCU → ${describeFrame(f)}');
-    }
-    _gd32Heartbeat?.cancel();
-    _gd32Heartbeat = Timer.periodic(const Duration(seconds: 1), (_) {
-      if (!running.value) return;
-      final f = gd32HeartbeatFrame();
-      if (f.isNotEmpty) _cfcpSend(f, log: 'MCU → ${describeFrame(f)}');
-    });
-    _emit(
-      LogKind.mcu,
-      'GD32: MCU 对端已就绪（基线帧 + 1 Hz 心跳）；'
-      '集群状态见 SoC 广播，上行车辆信号帧格式未解出',
+  /// 现在统一由 [DashUpFeeder] 按 EMULATION.md §41 的三段式进场喂数据：
+  /// pre-arm（KL15+RTC，禁喂解锁）→ settle（20 拍 gear=0）→
+  /// enter（只写一次 gear=1）→ 0.5 s 保持心跳 + 掉回待机时自愈。
+  /// 所有画面元素都由 guest 里原厂 DashTheme01 自己绘制，这里不合成像素。
+  void _startDashUp() {
+    _stopDashUp();
+    final feeder = DashUpFeeder(
+      send: (f) => _cfcpSend(f),
+      paintedPct: () => displayPaintedPct.value,
+      animating: () => animating.value,
+      telemetry: telemetry,
+      onLog: (s) => _emit(LogKind.mcu, s),
+      onPhase: (p, _) {
+        switch (p) {
+          case DashUpPhase.enter:
+            status.value = '仪表点亮中 · P 档进场动画';
+            break;
+          case DashUpPhase.hold:
+            _clusterEntered = true;
+            status.value = 'P 档主界面 · 固件原生渲染';
+            break;
+          case DashUpPhase.healing:
+            status.value = '仪表重启 · 重放进场序列';
+            break;
+          default:
+            break;
+        }
+      },
     );
+    _dashUp = feeder;
+    unawaited(feeder.start());
   }
 
-  void _stopGd32() {
-    _gd32Started = false;
-    _gd32Heartbeat?.cancel();
-    _gd32Heartbeat = null;
+  void _stopDashUp() {
+    _dashUp?.stop();
+    _dashUp = null;
+    _clusterEntered = false;
   }
 
   /// 车身语义状态变化时的处理。
   ///
-  /// 发灯态位图帧（集群当前**不消费**我们写的灯态，实测 0 px；真正驱动转向/
-  /// 双闪/远光指示灯要靠 MCU→SoC 上行车辆信号帧，格式见 EMULATION.md §29）。
+  /// 发下行灯态位图（0x21407072，集群不消费，实测 0 px）；真正驱动顶部
+  /// 指示灯的是上行 indicator_lamp 0x2170951E（EMULATION.md §41）。
+  /// 该属性默认**不喂**：固件从不擦除旧像素，灯只能加不能减，且 ABS_fault
+  /// 会弹故障框卡住 App；要喂必须在进场动画之后只喂一次。
   void _emitMcuState() {
-    if (!_gd32Started) return;
+    if (!running.value) return;
     for (final f in gd32StateFrames(mcu.state.value)) {
       _cfcpSend(f, log: 'MCU → ${describeFrame(f)}');
     }
@@ -1292,7 +1327,7 @@ class QemuController {
     _shutdownRequested = false;
     _shutdownCommandSent = false;
     _mcuTimer?.cancel();
-    _stopGd32();
+    _stopDashUp();
     _wakeFile = null;
     _wakeFired = false;
     _shutdownWakeFile = null;
@@ -1320,7 +1355,7 @@ class QemuController {
     _shutdownTimer?.cancel();
     _disposed = true;
     _starting = false;
-    _stopGd32();
+    _stopDashUp();
     bridge.stop();
     _timer?.cancel();
     _tick?.cancel();
