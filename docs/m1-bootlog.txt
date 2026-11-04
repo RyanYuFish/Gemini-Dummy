@@ -1,0 +1,23 @@
+# Sunplus SP8368 原装内核 M1 启动日志（从 __log_buf 提取）
+# kernel: Linux-4.9.217 (150Aura dump @0x880000), machine: sunplus-sp8368
+# date: 2026-10-30
+
+[    0.125222] ipc:1.6
+[    0.000000]     vmalloc : 0xd0800000 - 0xff800000   ( 752 MB)
+[    0.000000]     lowmem  : 0xc0000000 - 0xd0000000   ( 256 MB)
+[    0.000000]     modules : 0xbf800000 - 0xc0000000   (   8 MB)
+[    0.000000]       .text : 0xc0408000 - 0xc06cecd0   (2844 kB)
+[    0.000000]       .init : 0xc07de000 - 0xc07fe000   ( 128 kB)
+[    0.000000]       .data : 0xc07fe000 - 0xc0834ed8   ( 220 kB)
+[    0.000000]        .bss : 0xc0836000 - 0xc084f3ec   ( 101 kB)
+Booting Linux on physical CPU 0x0
+Linux version 4.9.217 (root@b543642127df) (gcc version 9.2.1 20191025 (GNU Toolchain for the A-profile Architecture 9.2-2019.12 (arm-9.10)) ) #1 Mon Jul 21 20:26:22 CST 2025
+sp_map_io
+sp_init_early: open backlight
+Kernel command line: root=/dev/blockrom8 init=/init console=ttyS0,921600 earlycon=uart,mmio,0x9C102080
+Memory: 251328K/262144K available (2842K kernel code, 219K rwdata, 944K rodata, 128K init, 100K bss, 6720K reserved, 4096K cma-reserved)
+init arch timer
+sp_config_init() failed
+Console: colour dummy device 80x30
+devtmpfs: initialized
+sp_bootup_prot_get_range: invalid index 0

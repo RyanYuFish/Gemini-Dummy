@@ -1,0 +1,25 @@
+# QEMU 构建产物（运行时依赖，但可重新编译出来）
+qemu-src/build/
+
+# 整机镜像与原厂内核：体积大且版权归原厂，默认不随源码分发。
+# 需要时从你自己的设备 dump 得到（见 README §7 合规红线），放到 images/ 下：
+#   images/ae5i.spvd         整机 flash pack（512 MB）
+#   images/kernel-ae5i.bin   原厂内核（uImage，body@0x40）
+images/*.spvd
+images/kernel-*.bin
+
+# 历史 Debian 路线的内核 deb 包（可从 apt 重新获取）
+kernel/*.deb
+*.deb
+
+# 生成物 / 本地缓存
+__pycache__/
+*.pyc
+.DS_Store
+dist/
+logs/
+*.ppm
+*.bin.tmp
+flutter_app/.dart_tool/
+flutter_app/build/
+flutter_app/macos/Flutter/ephemeral/

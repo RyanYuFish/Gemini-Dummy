@@ -1,0 +1,172 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>ZEEHO AE5I 仪表模拟器</title>
+<style>
+  :root{
+    --bg:#121417; --panel:#1a1d21; --panel2:#212529; --line:#2c3138;
+    --text:#e6e9ec; --dim:#98a2ad; --accent:#3ddc97; --warn:#ffb454; --err:#ff6b6b;
+    --mono:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--text);height:100vh;overflow:hidden;
+       display:flex;flex-direction:column;
+       font:13px/1.5 -apple-system,BlinkMacSystemFont,"PingFang SC","Microsoft YaHei",sans-serif}
+  header{flex:none;display:flex;align-items:center;gap:14px;padding:10px 16px;background:var(--panel);
+         border-bottom:1px solid var(--line)}
+  header h1{margin:0;font-size:14px;font-weight:650;letter-spacing:.3px}
+  header .sub{color:var(--dim);font-size:11px}
+  .dot{width:8px;height:8px;border-radius:50%;background:var(--dim);flex:none}
+  .dot.on{background:var(--accent);box-shadow:0 0 8px var(--accent)}
+  .spacer{flex:1}
+  button{background:var(--panel2);color:var(--text);border:1px solid var(--line);
+         border-radius:6px;padding:6px 12px;font-size:12px;cursor:pointer}
+  button:hover{border-color:#3f464f;background:#262b31}
+  button:disabled{opacity:.45;cursor:default}
+  main{flex:1;min-height:0;display:grid;grid-template-columns:minmax(420px,1fr) minmax(380px,1fr);
+       gap:12px;padding:12px}
+  .panel{background:var(--panel);border:1px solid var(--line);border-radius:8px;
+         display:flex;flex-direction:column;min-height:0}
+  .panel > h2{margin:0;padding:8px 12px;font-size:11px;font-weight:600;color:var(--dim);
+              text-transform:uppercase;letter-spacing:.8px;border-bottom:1px solid var(--line)}
+  .screen{flex:1;display:flex;align-items:center;justify-content:center;padding:10px;
+          background:radial-gradient(ellipse at 50% 40%,#1e2228,#14171b);min-height:0}
+  .screen img{width:100%;height:100%;object-fit:contain;border:1px solid #000;border-radius:4px;
+              image-rendering:pixelated;background:#000}
+  .screen .hint{color:var(--dim);font-size:12px}
+  .log{flex:1;overflow:auto;margin:0;padding:8px 10px;font:11px/1.45 var(--mono);
+       white-space:pre-wrap;word-break:break-all;color:#c8d0d8;min-height:0}
+  .log .w{color:var(--warn)} .log .e{color:var(--err)} .log .k{color:var(--accent)}
+  .keys{padding:10px 12px;border-top:1px solid var(--line);background:var(--panel2)}
+  .keys .row{display:flex;flex-wrap:wrap;gap:8px}
+  .keys .cap{font-size:10px;color:var(--dim);margin-bottom:6px;text-transform:uppercase;letter-spacing:.8px}
+  .key{min-width:62px;padding:8px 10px;font-size:11px;font-weight:600;text-align:center}
+  .note{padding:8px 12px;font-size:11px;color:var(--dim);border-top:1px solid var(--line)}
+  footer{flex:none;padding:6px 16px;font-size:11px;color:var(--dim);border-top:1px solid var(--line);
+         background:var(--panel);display:flex;gap:16px;align-items:center}
+  footer .spacer{flex:1}
+  @media(max-width:980px){body{height:auto;overflow:auto}main{grid-template-columns:1fr}}
+</style>
+</head>
+<body>
+<header>
+  <span class="dot" id="dot"></span>
+  <h1>ZEEHO AE5I 仪表模拟器</h1>
+  <span class="sub">Sunplus SP8368-U (GEMINI) · Cortex-A7 · QEMU virt</span>
+  <span class="spacer"></span>
+  <button id="btnStart">启动</button>
+  <button id="btnStop">停止</button>
+</header>
+
+<main>
+  <section class="panel">
+    <h2>仪表画面 · 1024×600</h2>
+    <div class="screen"><img id="frame" alt="instrument screen"><span class="hint" id="hint">等待画面…</span></div>
+    <div class="note">画面来自 QEMU <code>screendump</code>（framebuffer 1024×600）。当前 Launcher 因缺少
+      Sunplus 专有 <code>/dev/chunkmem</code> 与 EIPC 而在视频初始化阶段 segfault，故画面为黑。</div>
+  </section>
+
+  <section class="panel">
+    <h2>串口日志 · ttyS0</h2>
+    <pre class="log" id="log"></pre>
+  </section>
+</main>
+
+<section class="panel" style="flex:none;margin:0 12px 8px">
+  <h2>操作按键</h2>
+  <div class="keys">
+    <div class="cap">仪表物理键（经 QEMU 注入；真车由 GD32 MCU 走 CFCP /dev/ttyS1 上报）</div>
+    <div class="row" id="keys"></div>
+  </div>
+  <div class="note">说明：真车按键由 MCU 采集后经 <code>/dev/ttyS1</code> 的 CFCP 帧上报，
+    经 <code>cfcp-keypad</code> 转成 Linux input 事件；此处暂用 QEMU 键盘注入占位，
+    CFCP 通道待接入。</div>
+</section>
+
+<footer><span id="status">就绪</span><span class="spacer"></span>
+  <span>本机：QEMU 11.1.2 · 内核 6.12.107+deb13-armmp · 仪表 rootfs SW.1.01.15</span></footer>
+
+<script>
+const KEYS=[['SET','ret'],['MODE','m'],['▲ 上','up'],['▼ 下','down'],
+            ['◀ 左','left'],['▶ 右','right'],['READY','r'],['P 档','p']];
+const $ = id => document.getElementById(id);
+let lastSize = -1, frameTimer = null;
+
+KEYS.forEach(([label,name])=>{
+  const b=document.createElement('button');
+  b.className='key'; b.textContent=label;
+  b.onclick=()=>sendKey(name,b);
+  $('keys').appendChild(b);
+});
+
+async function sendKey(name,btn){
+  btn.disabled=true;
+  try{
+    const r=await fetch('/api/key',{method:'POST',body:JSON.stringify({key:name})});
+    const j=await r.json();
+    status('sendkey '+name+(j.out&&j.out.trim()?' → '+j.out.trim().slice(0,60):''));
+  }catch(e){ status('按键失败: '+e.message); }
+  setTimeout(()=>btn.disabled=false,220);
+}
+
+async function pollStatus(){
+  try{
+    const j=await (await fetch('/api/status')).json();
+    $('dot').className='dot'+(j.running?' on':'');
+    $('btnStart').disabled=j.running; $('btnStop').disabled=!j.running;
+    if(!j.running) status('QEMU 未运行');
+  }catch(e){ $('dot').className='dot'; }
+}
+
+async function pollLog(){
+  try{
+    const j=await (await fetch('/api/log')).json();
+    if(j.size!==lastSize){
+      lastSize=j.size;
+      const el=$('log');
+      const atBottom = el.scrollTop + el.clientHeight >= el.scrollHeight - 40;
+      el.innerHTML = highlight(j.text.slice(-60000));
+      if(atBottom) el.scrollTop = el.scrollHeight;
+    }
+  }catch(e){}
+}
+
+function escapeHtml(s){return s.replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));}
+function highlight(t){
+  return escapeHtml(t).split('\n').map(l=>{
+    let c='';
+    if(/panic|fault|error|failed|ERR|Cannot|cannot find|segv/i.test(l)) c='e';
+    else if(/warn|WRN|\[FAIL\]|not found/i.test(l)) c='w';
+    else if(/\[ok\]|===|Launcher|init start|\[TS\]/i.test(l)) c='k';
+    return c?('<span class="'+c+'">'+l+'</span>'):l;
+  }).join('\n');
+}
+
+function refreshFrame(){
+  const img=$('frame');
+  img.onload=()=>{img.style.display='block'; $('hint').style.display='none';};
+  img.onerror=()=>{img.style.display='none'; $('hint').style.display='block';};
+  img.src='/api/frame.png?t='+Date.now();
+}
+
+function status(t){ $('status').textContent=t; }
+
+$('btnStart').onclick=async()=>{
+  status('启动中…');
+  const j=await (await fetch('/api/start',{method:'POST'})).json();
+  status(j.started?'QEMU 已启动，等待 init 拉起服务链…':'QEMU 已在运行');
+  refreshFrame();
+};
+$('btnStop').onclick=async()=>{
+  await fetch('/api/stop',{method:'POST'});
+  status('已停止');
+};
+
+pollStatus(); pollLog(); refreshFrame();
+setInterval(pollStatus,2000);
+setInterval(pollLog,1200);
+setInterval(refreshFrame,1800);
+</script>
+</body>
+</html>
