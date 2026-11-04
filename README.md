@@ -24,6 +24,9 @@
                                               /tmp/ui-frame.ppm (1024×600)
 ```
 
+> 仓库：<https://github.com/RyanYuFish/Gemini-Dummy>（本仓库 = 项目本体，模型 + 工具 + 文档；
+> 整机镜像与原厂内核体积大且版权归原厂，不随源码分发，见 §7 与 `.gitignore`）。
+
 **当前状态**：P 档主界面（整车 + 右侧茶青墙大 P + 绿地面 + 顶部绿光条 + 左列数据 +
 底栏）已由固件自己渲染点亮，帧统计 **非黑 59.6% / 茶青 45%**。
 样张：[`artifacts/dash_fw_real_vs_emu.png`](artifacts/dash_fw_real_vs_emu.png)（左实车 / 右仿真）。
@@ -286,4 +289,3 @@ Animation_Setinit(sence)      // state=this+0x70c, 当前场景=this+0x704
 
 - 模型代码、工具、文档：本仓库自有，可自由取用。
 - QEMU 本身遵循其上游 GPLv2 许可；本仓库只包含**新增的机器模型**与探针。
-- 感谢 ZEEHO AE5i 仪表固件作者 —— 本项目的全部画面与数据都来自他们的实现。
