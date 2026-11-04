@@ -23,4 +23,7 @@ logs/
 flutter_app/.dart_tool/
 flutter_app/build/
 flutter_app/macos/Flutter/ephemeral/
-Release的替身 
+
+# macOS Finder 替身（alias）：只指向本机构建产物路径，禁止提交/上传
+Release的替身
+*的替身
