@@ -2816,12 +2816,107 @@ static void sp_fb_dump(SP8368State *s, unsigned idx)
          */
         uint32_t *bg = g_new0(uint32_t, w * h);
         uint32_t bgaddr = sp_fb_win_addr[1];
+        uint32_t *ref = NULL;          /* top-clamp reference, per column */
+        unsigned top = 0;
 
         if (s->fb_scanout_known[1]) {
             bgaddr += s->fb_scanout_page[1] * (uint64_t)w * h * 4u;
         }
         address_space_read(&address_space_memory, bgaddr,
                            MEMTXATTRS_UNSPECIFIED, bg, w * h * 4);
+
+        /*
+         * §48 top edge clamp (authorised by the user 2026-11-05).
+         *
+         * The Qt scene paints the top status-bar strip opaque black; on real
+         * hardware that strip shows the PFC background instead.  This panel
+         * image has no background bitmap and the guest has no /dev/fb1, so
+         * rather than inventing artwork we extend the first pixel the FIRMWARE
+         * itself painted below the strip upwards, per column.  Only pure-black
+         * (or transparent) pixels inside the strip are replaced, and only in
+         * the composited output -- guest memory is never modified.  Every
+         * colour still originates from a pixel DashTheme01 produced.
+         *
+         * SP_PFC_TOP_CLAMP=0 disables it; SP_PFC_TOP_ROWS=N sets the height.
+         */
+        {
+            const char *tc_s = getenv("SP_PFC_TOP_CLAMP");
+            const char *tr_s = getenv("SP_PFC_TOP_ROWS");
+            unsigned rows = tr_s ? strtoul(tr_s, NULL, 0) : 40;
+
+            /*
+             * OFF by default: A/B on the real panel showed the strip's own
+             * icon remnants get smeared into vertical barcode-like stripes,
+             * and the rows below are themselves almost black (measured
+             * #000100), so the visual result is worse than the black strip.
+             * Kept behind SP_PFC_TOP_CLAMP=1 for further experiments only.
+             */
+            if (tc_s && atoi(tc_s) != 0 && rows && rows < h) {
+                uint8_t *tmp = g_malloc(w * 4);
+                unsigned yy, xx;
+
+                top = rows;
+                ref = g_new0(uint32_t, w);
+                {
+                    unsigned *ref_br = g_new0(unsigned, w);
+
+                    /*
+                     * Take the DARKEST non-black pixel per column: the strip
+                     * sits over the scene's dark background, while icons and
+                     * highlights are bright.  Picking the brightest/first
+                     * non-black pixel smeared those icons into vertical
+                     * stripes at the top of the panel.
+                     */
+                    for (yy = top; yy < h && yy < top + 240; yy++) {
+                        address_space_read(&address_space_memory,
+                                           addr + (uint64_t)yy * w * 4,
+                                           MEMTXATTRS_UNSPECIFIED, tmp,
+                                           w * 4);
+                        for (xx = 0; xx < w; xx++) {
+                            uint32_t p = tmp[xx * 4 + 0] |
+                                         tmp[xx * 4 + 1] << 8 |
+                                         tmp[xx * 4 + 2] << 16;
+                            unsigned br;
+
+                            if (!p) {
+                                continue;
+                            }
+                            br = ((p & 0xff) + ((p >> 8) & 0xff) +
+                                  ((p >> 16) & 0xff)) / 3;
+                            if (br > 80) {
+                                continue;   /* icon / highlight, not背景 */
+                            }
+                            if (!ref[xx] || br < ref_br[xx]) {
+                                ref[xx] = p;
+                                ref_br[xx] = br;
+                            }
+                        }
+                    }
+                    /*
+                     * Columns with no dark pixel keep the strip black, but a
+                     * hard black column next to a coloured one would still
+                     * read as a stripe: bridge such gaps from the left, then
+                     * from the right.
+                     */
+                    for (xx = 1; xx < w; xx++) {
+                        if (!ref[xx]) {
+                            ref[xx] = ref[xx - 1];
+                        }
+                    }
+                    for (xx = w - 1; xx > 0; xx--) {
+                        if (!ref[xx - 1]) {
+                            ref[xx - 1] = ref[xx];
+                        }
+                    }
+                    g_free(ref_br);
+                }
+                g_free(tmp);
+                if (getenv("SP_PFC_TRACE")) {
+                    fprintf(stderr, "PFC top clamp: rows 0..%u extended from "
+                            "the firmware's own pixels below\n", top - 1);
+                }
+            }
+        }
         row = g_malloc(w * 4);
         for (y = 0; y < h; y++) {
             uint8_t *o = g_malloc(w * 3);
@@ -2834,6 +2929,13 @@ static void sp_fb_dump(SP8368State *s, unsigned idx)
                                  row[x * 4 + 2] << 16 | row[x * 4 + 3] << 24;
                 uint32_t px = (osdpx & 0x00ffffffu) ? osdpx
                                                     : bg[(uint64_t)y * w + x];
+
+                /* §48: pure-black pixels inside the top strip borrow the
+                 * colour the firmware painted below (no invented artwork). */
+                if (ref && y < top && !(px & 0x00ffffffu) &&
+                    (ref[x] & 0x00ffffffu)) {
+                    px = ref[x] | 0xff000000u;
+                }
                 uint8_t r = (px >> 16) & 0xff;
                 uint8_t g = (px >> 8) & 0xff;
                 uint8_t b = px & 0xff;
@@ -2850,6 +2952,7 @@ static void sp_fb_dump(SP8368State *s, unsigned idx)
             g_free(o);
         }
         g_free(row);
+        g_free(ref);
         g_free(bg);
         fclose(f);
         if (frame && rename(path, frame) != 0) {
