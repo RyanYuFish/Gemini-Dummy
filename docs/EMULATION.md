@@ -3931,3 +3931,85 @@ PfcDispServer 在跑 → get_bg_info 1024/600 成功
 本轮 `libspdovcfg.so` / `libpfc_service.so` / `pfc_server` 已从 SPVD 的
 `spsdk` 分区（squashfs @0x1181000）解出至 `/tmp/ae5i_spsdk_root`，
 供后续反汇编 `subcmd=0x54e1` 的调用点使用。
+
+---
+
+## 46. 按 id 分流的 IPC 路由：把 DOV 请求真实转发给 PfcDispServer（2026-11-05 晚）
+
+用户要求：「按照 id 分流，让仿真器按照真实流程渲染合成画面」。本轮只改
+**QEMU 模型的 IPC 收发语义**，不碰任何像素、不碰合成器、不引入外部位图。
+画面仍由 guest 固件自己绘制。
+
+### 46.1 取证（改代码前）
+
+`SP_IPC_TRACE=1` 抓一次完整启动：
+
+| 观察 | 结果 |
+|---|---|
+| doorbell 总数 | **193** 个请求块，`owner` 全部落在 `0xC0408000..0xD0000000`、`dword2` bit15 **全为 0** ⇒ 都是内核侧 `IPC_FunctionCall` waiter 发出的请求，模型是硬件对端 |
+| id 分布 | `5`×161、`3`×7、`6`×6、`9`×6、`18`×6、**`23(0x17)`×3**、`2/1/8/15` 各 1 |
+| `id=0x17` 请求 | 3 次，`len=14`，块内 `w[8]=000054e1`（与用户给的 `subcmd=0x54e1` 吻合），`owner`/`seq` 各不相同 |
+| `mode=2` 用户态延迟投递 | **`no userspace fifo, dropped` 73 次、`userspace copy` 0 次** —— `sp_ipc_user_fifo_ready()` 的 `+0x578/+0x57c` 偏移是猜的，一次都没匹配 |
+| 更关键 | 现有 `req_kernel` 把 `id==9 / 0x17` 也**强制归内核**，`mode==2 && !req_kernel` 分支永远轮不到 DOV ⇒ daemon 从未收到请求 |
+| 全局 `SP_IPC_MODE=1` | 串口 `RPC SERVER #7 NOT RUNNING!` **89490 次**，显示栈早期停摆，连 DOV 请求都没走到 |
+
+⇒ 与用户判断一致：**不能用全局 mode 开关**，必须按 id 分流。
+
+### 46.2 实现（`qemu-src/hw/arm/sunplus-sp8368.c`）
+
+* 新增 `SP_IPC_IDROUTE`：
+  * `0` = 关闭（回到只伪造应答的旧行为，A/B 基线）
+  * `1` = **默认**：只对 `id=0x17` 做真实转发；所有其它 id 保持 origin-correct 内核应答
+  * `2` = 实验性 hold 事务（见 §46.3，会卡启动，仅保留作 A/B）
+* 真实顺序（一个 doorbell 产生两块，靠 `ipc_timer` 隔开 100 µs）：
+  1. mailbox ← **请求副本**，`dword2` bit15 **清零** ⇒ `rpc_isr()` 路由到用户态 fifo，`PfcDispServer` 读到 DOV 查询；
+  2. 100 µs 后 mailbox ← **应答**，`dword2` bit15 **置 1**、status=0 ⇒ `rpc_isr()` copy 回原 waiter 的 msg 并唤醒。
+* 转发块保留原 `owner`（`rpc_isr` 靠 bit15 判路由，不是靠 owner；清零 owner 会让 ISR 把转发当非法内核 msg，实测卡启动）。
+* `sp_ipc_deliver_user()` 不再用猜错的 fifo 偏移**拦截**投递：该检查降为诊断，块一定写进 mailbox，由 guest 内核自己路由/丢弃。同时按 bit15 区分「userspace-request / kernel-reply」日志，kernel reply 不做 fifo 探测。
+* `SP_IPC_DOV_KEEPSEQ`（默认 1）：应答**保留 `dword4` seq**。反汇编 `rpc_check_seq`(0xc04176f4) 确认它比较 `msg+0x10` 与 `msg+0xc` 指向的记录；旧代码把 `dword4` 清 0 会破坏该契约。
+* `SP_IPC_IDROUTE=2` 仍实现了完整的「保存 waiter → 转发 → 等 daemon 回包 → 按 bit15 合并送回 waiter」事务（含 200 ms 超时兜底、`dov_timer`），但实测不可用，默认不启用。
+* 全程**未改动 `sp_fb_dump()` 合成逻辑**、未添加背景色平面、未重绘/合成任何像素。
+
+### 46.3 A/B（每轮 25 s 真实启动 + MCU 喂食）
+
+| 方案 | 转发 | 内核应答 | 画面 | `get dov failed` | 显示栈 |
+|---|---|---|---|---|---|
+| 基线 `mode=2` | 0/3（73 次全丢） | 立即 | 正常 | 3 | 正常 |
+| `route=1` 先应答后转发 | 3/3 | 立即 | 正常 54.6% / 茶青 44.9% | 3 | 正常 |
+| `route=1` + 保留 seq | 3/3 | 立即 | 正常 54.6% / 45.0% | 3 | 正常 |
+| `route=2` hold 等回包 | 1 | 200 ms 超时兜底 | **0.00% 黑屏** | 0（未走到） | 启动卡住 |
+| 先转发 + 1 ms 延迟应答 | 1 | 1 ms | **0.00% 黑屏** | 0（未走到） | 启动卡住 |
+| **先转发 + 100 µs 延迟应答（定稿）** | **3/3** | **100 µs，3/3** | **正常 54.8% / 45.1%** | 3 | **无 #7 卡死** |
+
+结论：**DOV 请求的内核 waiter 在启动关键路径上，必须近乎立刻唤醒**；
+1 ms 延迟、200 ms hold 都会让整个显示栈停摆。daemon 的回包也**不经过
+doorbell**（hold 模式 `daemon answer merged` 为 0 次），所以「等回包再送回
+waiter」在这套内核/固件里模型侧不可观测。定稿采用「立即应答 + 同帧转发、
+按 bit15 分流」这一唯一不破坏启动的真实流程。
+
+### 46.4 验收
+
+| 项 | 结果 |
+|---|---|
+| `build_model.py` | 通过，二进制含 `IPC idroute` / `SP_IPC_IDROUTE` 标记 |
+| 端到端 `--duration 25 --shutdown` | 非黑 **59.60%** / 茶青 **44.84%**；进场 `4.0→47.6→…→59.6%`；关机 `10.9→12.1→1.3→0.0%`（`SHUTANIM VISIBLE`）；**`RESULT PASS`** |
+| IPC 转发 | `DOV id=0x17` **3/3**，`deferred kernel-reply` **3/3**，`RPC SERVER #7 NOT RUNNING` **0** |
+| `dart analyze lib tool test` | 无问题 |
+| Dart / Python 帧字节 | 19 帧 `diff` 为空 |
+| `flutter test`（6 套件） | 67 项全通过 |
+| app | **无需重建**：本轮只改模型二进制，`machine.dart` 的 `SP_FB_COMPOSITE=1` 不变 |
+
+### 46.5 仍未闭环（如实记录，未假装修好）
+
+* `PFC_DOV : get dov failed` 仍为 **3 次**。三次日志客观上都出现在
+  `getPlatformMacName [--IN--]` → `ZEEHO-b5aa15` 期间（串口 4.0 s、
+  17.7 s、18.1 s）；本节**不**据此重下「与图层无关」的结论（§45.1 已因
+  片面被用户更正），只记录可复现的上下文。
+* 内核语义冲突：`rpc_check_seq()` 把 `msg+0xc` 当 **seq 记录指针**
+  （`ldr r7,[r4,#0xc]; add 0x7f000000; ldr r3,[r7]; cmp seq`），而
+  `dov_send_cmd()` 把同一偏移当 **u16 成功状态字**。模型现有的
+  「echo 请求块 + 清 dword3/4」无法同时满足两者 —— 这是下一步必须按内核
+  msg 布局重建应答（补齐 payload_end 指针与其指向的 seq 记录）的原因。
+* daemon 回包不经 doorbell ⇒ 模型看不到图层配置的返回内容。
+* guest 只有 `/dev/fb0`、无 fb1，原厂镜像无 `*.yuv` ⇒ window1 仍为空层。
+* **顶部黑条仍在**，右下角进场动画首帧残块仍在。观感由用户判断。

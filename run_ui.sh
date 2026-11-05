@@ -18,9 +18,13 @@ export SP_FB_FRAME=/tmp/ui-frame.ppm
 #   ★ 别改成 1（只回用户态）：id=3（fbdss 取 UI 分辨率）用的是内核侧
 #   IPC_FunctionCall 等待者，只回用户态会让它永远等不到 → 整个显示栈停摆
 #   （串口刷 "RPC SERVER #7 NOT RUNNING!"），CFCP 也不再发帧。
-#   id=23(0x17)=DOV 查询属于用户态↔用户态，要真正答对必须把请求转发给
-#   PfcDispServer 再把它的回包送回等待者 —— 模型目前只能伪造回包，所以
-#   "PFC_DOV : get dov failed" 仍有 3 次（开机早期）。见 EMULATION.md §42.6。
+#   id=23(0x17)=DOV 查询现在由模型**按 id 分流**转发给 PfcDispServer：
+#   先写 bit15=0 的请求副本（内核路由到用户态 fifo），100us 后再写
+#   bit15=1 的应答唤醒原 waiter。其它 id 一律保持内核回包，所以不会
+#   饿死 id=3。开关 SP_IPC_IDROUTE=0 关闭 / =2 实验性 hold（会卡启动，
+#   不要用）；SP_IPC_DOV_KEEPSEQ=0 可回退旧的清 seq 行为。见 §46。
+#   已知：daemon 回包不经 doorbell，"get dov failed" 仍有 3 次；
+#   DOV 图层配置 / 顶部黑条仍未闭环。
 export SP_PFC_TRACE=1 SP_IPC_MODE=2
 export SP_VDISK=$SPVD SP_VDISK_BASE=0x50000000
 exec "$QEMU" -M sunplus-sp8368 -m 256 -kernel "$KERNEL" -append "$APPEND" \

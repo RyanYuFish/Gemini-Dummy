@@ -923,6 +923,16 @@ typedef struct SP8368State {
     uint8_t ipc_pending[0x50];
     bool ipc_pending_valid;
 
+    /* §46 per-id DOV relay: the real request/answer round trip with the
+     * userspace PfcDispServer, instead of a fabricated reply.  The kernel
+     * waiter's msg is stashed here while the daemon owns the request. */
+    QEMUTimer *dov_timer;
+    uint8_t dov_req[0x50];
+    uint32_t dov_owner;
+    uint32_t dov_seq;
+    bool dov_pending;       /* request forwarded, daemon answer not seen yet */
+    bool dov_waiting;       /* kernel waiter still asleep (hold mode) */
+
     /* Misc IP window (currently only the NAND BCH ECC controller answers). */
     MemoryRegion ip;
     uint32_t ip_regs[SP_IP_SIZE / 4];
@@ -1705,6 +1715,42 @@ static void sp_ipc_stub(SP8368State *s)
     len   = w[2] & 0xFFFF;
     pphys = w[6];
 
+    /*
+     * §46: in hold mode a forwarded DOV request is answered by the userspace
+     * daemon on a LATER doorbell.  That block carries the daemon's own owner
+     * word (different from the original waiter's msg) plus the layer config in
+     * its payload.  Merge the payload into the saved header and wake the
+     * original waiter through the kernel copy-back branch (dword2 bit15=1),
+     * exactly as rpc_isr() expects.  See EMULATION.md §46.
+     */
+    if (s->dov_waiting && id == 0x17 && w[0] != s->dov_owner) {
+        uint32_t ans[SP_IPC_BLK / 4];
+        unsigned i;
+
+        memcpy(ans, s->dov_req, sizeof(ans));
+        for (i = 3; i < SP_IPC_BLK / 4 - 1; i++) {
+            ans[i] = w[i];
+        }
+        ans[2] = 0x80000000u | (ans[2] & 0xFFFFu);
+        ans[3] = 0;                 /* dov_send_cmd() success status word */
+        ans[4] = s->dov_seq;        /* rpc_check_seq() */
+        address_space_write(&address_space_memory,
+                            SP_PSU_ADDR + SP_PSU_IPC_RSP,
+                            MEMTXATTRS_UNSPECIFIED, ans, sizeof(ans));
+        s->dov_pending = false;
+        s->dov_waiting = false;
+        s->psu_regs[SP_PSU_IPC_DOORBELL >> 2] = 0;
+        if (s->ipc_irq) {
+            qemu_irq_pulse(s->ipc_irq);
+        }
+        if (s->ipc_trace) {
+            fprintf(stderr, "IPC idroute: DOV daemon answer merged -> waiter "
+                    "%08x seq=%08x payload=%08x\n",
+                    s->dov_owner, s->dov_seq, w[3]);
+        }
+        return;
+    }
+
     /* AE5I _ipc_swapbuf sends cmd 6, inline {window, buffer index}.
      * Record each accepted window scanout page so snapshots follow flips.
      *
@@ -1934,22 +1980,100 @@ static void sp_ipc_stub(SP8368State *s)
          * echo above leaves the request's pointer low-half there, so clear it.
          */
         if (id == 0x17) {
-            reply[3] = 0;
-            reply[4] = 0;
+            const char *ks = getenv("SP_IPC_DOV_KEEPSEQ");
+            int keepseq = ks ? atoi(ks) : 1;
+
+            reply[3] = 0;              /* dov_send_cmd() success status word */
+            /*
+             * dword4 is the seq IPC_FunctionCall() stashed at msg+0x10.
+             * rpc_check_seq() (0xc04176f4) compares it against the record
+             * pointed to by msg+0xc; clearing it makes rpc_isr() discard the
+             * reply and the waiter times out -> "get dov failed".  Keep it by
+             * default; SP_IPC_DOV_KEEPSEQ=0 restores the legacy behaviour.
+             */
+            if (!keepseq) {
+                reply[4] = 0;
+            }
         }
 
-        address_space_write(&address_space_memory,
-                            SP_PSU_ADDR + SP_PSU_IPC_RSP,
-                            MEMTXATTRS_UNSPECIFIED, reply, sizeof(reply));
+        /*
+         * §46 per-id routing.  A GLOBAL SP_IPC_MODE switch cannot work:
+         * answering everything on the userspace fifo starves id=3 (fbdss UI
+         * resolution, a kernel IPC_FunctionCall waiter) and the whole display
+         * stack stalls with "RPC SERVER #7 NOT RUNNING!".  Only the DOV
+         * request (0x17, subcmd 0x54e1) is forwarded to the userspace
+         * PfcDispServer; every other id keeps its origin-correct kernel reply.
+         *
+         * Real ordering for a forwarded call:
+         *   1. mailbox <- REQUEST with dword2 bit15 CLEAR  -> rpc_isr() routes
+         *      it to the userspace fifo, PfcDispServer reads and configures
+         *      the DOV layer;
+         *   2. (1 ms later) mailbox <- REPLY with bit15 SET -> rpc_isr()
+         *      copies it back into the original waiter's msg and wakes it.
+         * Writing the kernel reply FIRST and the userspace copy afterwards
+         * leaves the wrong block visible to the ISR and the waiter reads a
+         * stale msg+0xc -> "get dov failed".
+         *
+         *   SP_IPC_IDROUTE=0  off (legacy fabricated reply only)
+         *                  1  forward-then-answer  (default, real ordering)
+         *                  2  EXPERIMENTAL hold-the-waiter round trip; proven
+         *                     to stall boot (daemon answers never reach the
+         *                     doorbell), kept only for A/B, do not use.
+         */
+        {
+            const char *r_s = getenv("SP_IPC_IDROUTE");
+            int route = r_s ? atoi(r_s) : 1;
+            bool dov = (id == 0x17) && route != 0;
+            bool hold = false;
+            uint32_t fwd[SP_IPC_BLK / 4];
 
-        /* Legacy SP_IPC_MODE=2: a second, delayed copy to the userspace fifo.
-         * Auto mode no longer needs it -- a single origin-correct reply is
-         * already routed by the guest kernel. */
-        if (mode == 2 && !req_kernel) {
-            memcpy(s->ipc_pending, usr, sizeof(s->ipc_pending));
-            s->ipc_pending_valid = true;
-            timer_mod(s->ipc_timer,
-                      qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + 100 * 1000);
+            if (dov && route == 2 && !s->dov_pending) {
+                memcpy(s->dov_req, req, sizeof(s->dov_req));
+                s->dov_owner = w[0];
+                s->dov_seq = w[4];
+                s->dov_pending = true;
+                s->dov_waiting = true;
+                hold = true;
+                timer_mod(s->dov_timer,
+                          qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
+                          200 * 1000 * 1000);
+            }
+            if (dov && !hold) {
+                /* rpc_isr() picks the destination from dword2 bit15, not from
+                 * dword0 (owner).  Keep owner intact: zeroing it made the ISR
+                 * treat the forward as a bogus kernel msg and stalled boot. */
+                memcpy(fwd, usr, sizeof(fwd));
+                address_space_write(&address_space_memory,
+                                    SP_PSU_ADDR + SP_PSU_IPC_RSP,
+                                    MEMTXATTRS_UNSPECIFIED, fwd, sizeof(fwd));
+                /* The kernel waiter is on the boot critical path: it MUST be
+                 * woken almost immediately.  1 ms (and 200 ms hold) both hung
+                 * the display stack; 100 us is short enough for boot and still
+                 * separates the two blocks for the ISR. */
+                memcpy(s->ipc_pending, reply, sizeof(s->ipc_pending));
+                s->ipc_pending_valid = true;
+                timer_mod(s->ipc_timer,
+                          qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + 100 * 1000);
+            } else if (hold) {
+                address_space_write(&address_space_memory,
+                                    SP_PSU_ADDR + SP_PSU_IPC_RSP,
+                                    MEMTXATTRS_UNSPECIFIED, usr, sizeof(usr));
+            } else {
+                address_space_write(&address_space_memory,
+                                    SP_PSU_ADDR + SP_PSU_IPC_RSP,
+                                    MEMTXATTRS_UNSPECIFIED, reply,
+                                    sizeof(reply));
+            }
+            /* NOTE: the legacy mode=2 "second copy for every userspace id" is
+             * intentionally NOT scheduled.  It was always dropped by the
+             * (wrong) fifo probe, so omitting it preserves the proven baseline
+             * exactly.  §46 routes BY ID, not by a global mode switch. */
+            if (dov && s->ipc_trace) {
+                fprintf(stderr,
+                        "IPC idroute: DOV id=0x17 -> daemon, delayed "
+                        "bit15 answer (owner=%08x seq=%08x hold=%d)\n",
+                        w[0], w[4], hold);
+            }
         }
     }
 
@@ -2029,11 +2153,32 @@ static void sp_ipc_deliver_user(void *opaque)
     }
     s->ipc_pending_valid = false;
 
-    if (!sp_ipc_user_fifo_ready(s, s->ipc_pending)) {
-        if (s->ipc_trace) {
-            fprintf(stderr, "IPC deliver: no userspace fifo, dropped\n");
+    /*
+     * §46: do NOT gate on sp_ipc_user_fifo_ready().  Its dev/fifo offsets were
+     * a guess (0x578 / 0x57c) and never matched -- 73/73 deliveries were
+     * dropped, which is exactly why PfcDispServer never saw a DOV request.
+     * The guest kernel owns those fifos and routes (or discards) the block
+     * itself; the model only has to place the block in the mailbox and raise
+     * the IRQ.  Keep the probe as a diagnostic only.
+     */
+    {
+        uint32_t idw = 0;
+
+        memcpy(&idw, s->ipc_pending + 8, 4);   /* dword2: id/status/len */
+        /* Only a bit15-CLEAR block is destined for the userspace fifo.  The
+         * deferred DOV kernel reply has bit15 SET and must never be probed
+         * (the offset table is a guess) nor dropped. */
+        if (!(idw & 0x80000000u) &&
+            !sp_ipc_user_fifo_ready(s, s->ipc_pending) && s->ipc_trace) {
+            fprintf(stderr, "IPC deliver: fifo offsets unknown, deferring "
+                    "routing to guest rpc_isr\n");
         }
-        return;
+        if (s->ipc_trace) {
+            fprintf(stderr, "IPC deliver: deferred %s block id=%u\n",
+                    (idw & 0x80000000u) ? "kernel-reply"
+                                        : "userspace-request",
+                    (idw >> 16) & 0x7fffu);
+        }
     }
 
     address_space_write(&address_space_memory, SP_PSU_ADDR + SP_PSU_IPC_RSP,
@@ -2045,6 +2190,39 @@ static void sp_ipc_deliver_user(void *opaque)
     }
     if (s->ipc_trace) {
         fprintf(stderr, "IPC deliver: userspace copy\n");
+    }
+}
+
+/*
+ * §46 fallback for hold mode.  If the userspace daemon never answers the
+ * forwarded DOV request, wake the kernel waiter with the legacy fabricated
+ * success reply after 200 ms.  This guarantees a DOV relay can never hang the
+ * display stack (the failure mode of the old global SP_IPC_MODE=1).
+ */
+static void sp_ipc_dov_timeout(void *opaque)
+{
+    SP8368State *s = opaque;
+    uint32_t ans[SP_IPC_BLK / 4];
+
+    if (!s->dov_pending || !s->dov_waiting) {
+        return;
+    }
+    memcpy(ans, s->dov_req, sizeof(ans));
+    ans[2] = 0x80000000u | (ans[2] & 0xFFFFu); /* kernel copy-back branch */
+    ans[3] = 0;                                 /* success status word */
+    ans[4] = s->dov_seq;                        /* rpc_check_seq() */
+    address_space_write(&address_space_memory,
+                        SP_PSU_ADDR + SP_PSU_IPC_RSP,
+                        MEMTXATTRS_UNSPECIFIED, ans, sizeof(ans));
+    s->dov_pending = false;
+    s->dov_waiting = false;
+    s->psu_regs[SP_PSU_IPC_DOORBELL >> 2] = 0;
+    if (s->ipc_irq) {
+        qemu_irq_pulse(s->ipc_irq);
+    }
+    if (s->ipc_trace) {
+        fprintf(stderr, "IPC idroute: DOV daemon timeout, fallback reply to "
+                "waiter %08x\n", s->dov_owner);
     }
 }
 
@@ -4473,6 +4651,7 @@ static void sp8368_init(MachineState *machine)
         int ipc_irq = irq_s ? atoi(irq_s) : 84;
         s->ipc_irq = qdev_get_gpio_in(DEVICE(s->gic), SP_GIC_SPI(ipc_irq));
         s->ipc_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, sp_ipc_deliver_user, s);
+        s->dov_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, sp_ipc_dov_timeout, s);
     }
 
     /* Injected board-config blob. SP_FW_ADDR is inside real DRAM, so the blob
