@@ -4013,3 +4013,94 @@ waiter」在这套内核/固件里模型侧不可观测。定稿采用「立即�
 * daemon 回包不经 doorbell ⇒ 模型看不到图层配置的返回内容。
 * guest 只有 `/dev/fb0`、无 fb1，原厂镜像无 `*.yuv` ⇒ window1 仍为空层。
 * **顶部黑条仍在**，右下角进场动画首帧残块仍在。观感由用户判断。
+
+---
+
+## 47. ★ 修复 `PFC_DOV : get dov failed`：状态字在 dword8，不在 dword3（2026-11-05 晚）
+
+### 47.1 根因（反汇编 + A/B 双证）
+
+`IPC_FunctionCall`（AE5I 内核 0xc0418070）对 `len <= 0x3c` 的调用走**内联载荷**：
+
+```asm
+0xc041813e  mov  r2, r6          ; len = 14
+0xc0418140  mov  r1, r7          ; caller buffer
+0xc0418142  adds r0, #0x14       ;  r0 = kernel msg + 0x14
+0xc0418148  bl   memcpy          ; msg+0x14 <- caller buffer
+...
+0xc041815c  addls.w r1, r4, #0x14  ; src = msg + 0x14
+0xc0418160  movls   r2, r6         ; len
+0xc0418162  movls   r0, r7         ; dst = caller buffer
+0xc0418164  bls   memcpy           ; caller buffer <- msg+0x14
+```
+
+`rpc_isr()`（0xc0418b7c 分支）把硬件应答块**整块 0x54 字节 copy 到 waiter msg**。
+两者叠加，`dov_send_cmd()` 里的
+
+```c
+if (*(u16 *)(msg + 0xc))  log("get dov failed");
+```
+
+读的 `msg+0xc` 实际是：
+
+```
+caller_buf + 0xc == kernel msg + 0x14 + 0xc == kernel msg + 0x20 == 应答块 dword8
+```
+
+而模型此前的应答是 echo 请求块，**dword8 正好是请求里的 `subcmd = 0x54e1`** ⇒ 永远非零。
+旧代码清的是 `dword3`（`msg+0x0c`，另一个字段），从来没有碰到 `dword8` —— 这就是
+历次「伪造回包状态=0」都不生效的原因。
+
+### 47.2 修复
+
+`qemu-src/hw/arm/sunplus-sp8368.c`，`id == 0x17` 的应答构造：
+
+```c
+reply[3] = 0;      /* 内核侧 payload_end/status 约定，保持 0 */
+reply[8] = 0;      /* ★ userspace 状态字：caller_buf+0xc == dword8 */
+reply[4] 保留 seq   /* rpc_check_seq() 契约 */
+```
+
+`SP_IPC_DOV_STATUS=1` 可回退到「不清 dword8」的旧行为做 A/B。
+
+### 47.3 验证
+
+| 项 | 修复前 | 修复后 |
+|---|---|---|
+| `PFC_DOV : get dov failed` | 3 次 | **0 次** |
+| DOV 请求转发 | 3/3 | **3/3** |
+| 非黑 / 茶青 | 59.48% / 44.78% | **59.48% / 44.78%**（无回归） |
+| 进场动画 | 4.0→59.6% | 4.0→59.6% |
+| 关机动画 | 10.9→12.1→0.0% | 10.9→12.1→0.0% |
+| `RESULT PASS` | ✅ | ✅ |
+| `dart analyze` / 19 帧 / 67 项测试 | ✅ | ✅ |
+
+### 47.4 顶部黑条：DOV 修好之后的真实状态
+
+DOV 查询成功后，`PfcDispServer` **没有写任何 VPP 图层寄存器**（`VPP stub id=9`
+仍只有 3 次控制位写：`0x41e5fff8 <- 0x0e/0x3a`、`0x41e614c0 <- 0x38`），
+window1 采样仍 **0.00% 非黑**。继续取证：
+
+| 证据 | 结果 |
+|---|---|
+| OSD 顶部 alpha 分布 | `y=0..15` **alpha=255 不透明黑**；`y=20..30` **alpha=0 真透明**；`y=50+` 又不透明 |
+| 通道序 | 已验证为 BGRA：OSD `00 ff ed ff` → 合成 `#edff00`，无 B/R 互换 |
+| `pat_logo` / `isp_logo` 分区 | 全 `0xFF`（**未烧录**） |
+| `userdata` 图片扫描 | 多个假 `BM`/JPEG 头，均为随机数据；`nvm` 里唯一 JPEG 是损坏的 200×200 |
+| `draw_background_from_nand` | `dd if=/tmp/sp/application/etc/background/<n>.yuv of=/dev/fb1`；guest **只有 `/dev/fb0`，没有 fb1** |
+| spapp squashfs | 超块完好（`bytes_used=0x340de07`，52.1 MB，lzo），但 id table 损坏，`unsquashfs` 读目录失败 |
+
+结论：真机顶部那层「透明处露出的背景」由 **PFC 背景层**提供，而这条链路在当前
+镜像 + 禁改内核的约束下物理上走不通 —— 没有 fb1 设备节点，`dd` 无处可写；
+`pat_logo` / `isp_logo` 未烧录，镜像里没有任何 1024×600 壁纸位图。
+
+**顶部黑条仍未解决。** 在不违反「禁止照实车照重绘/离线合成」的前提下，后续只能
+三选一（需用户定夺）：
+
+1. **模型按硬件 alpha 语义合成**：`alpha==0` → 背景层，`alpha==255` → OSD，
+   中间值按 premultiplied 混合。语义正确，但 window1 为空时结果仍是黑，
+   画面不会变 —— 只是把合成器修对。
+2. **顶部区域边缘延展**：把 `y<40` 的透明/纯黑像素用紧邻下方（`y≈40`）固件
+   已画出的实际像素填充。只影响顶部、不影响其他区域，对比度不会全局失真；
+   但这是模型合成层面的取样填充，不是固件行为，触碰用户红线，需明确授权。
+3. **维持现状**：接受顶部为原厂镜像限制，不再改渲染。

@@ -1983,13 +1983,40 @@ static void sp_ipc_stub(SP8368State *s)
             const char *ks = getenv("SP_IPC_DOV_KEEPSEQ");
             int keepseq = ks ? atoi(ks) : 1;
 
-            reply[3] = 0;              /* dov_send_cmd() success status word */
+            /*
+             * ★ §47 root cause of "PFC_DOV : get dov failed".
+             *
+             * IPC_FunctionCall(len=14 <= 0x3c) inlines the caller's buffer at
+             * kernel msg+0x14 (0xc041813e: memcpy(msg+0x14, user, len)) and,
+             * after rpc_isr() copies our 0x54-byte reply block over the msg,
+             * copies msg+0x14..+0x21 back into the caller's buffer
+             * (0xc041815c: memcpy(user, msg+0x14, len)).
+             *
+             * Therefore dov_send_cmd()'s `*(u16 *)(msg + 0xc)` reads
+             *     user_buf + 0xc == kernel msg + 0x20 == reply dword8
+             * -- NOT dword3.  Our echo left the request's subcmd 0x54e1
+             * there, i.e. exactly the non-zero value that is treated as
+             * failure.  Clearing dword3 (the old code) never touched it.
+             *
+             * reply dword3 stays 0 for the kernel-side payload_end/status
+             * convention; dword8 must be 0 for dov_send_cmd() to report
+             * success.  SP_IPC_DOV_STATUS=1 restores the broken legacy
+             * behaviour for A/B.
+             */
+            {
+                const char *st = getenv("SP_IPC_DOV_STATUS");
+                int legacy = st ? atoi(st) : 0;
+
+                reply[3] = 0;
+                if (!legacy) {
+                    reply[8] = 0;      /* userspace status word (msg+0xc) */
+                }
+            }
             /*
              * dword4 is the seq IPC_FunctionCall() stashed at msg+0x10.
              * rpc_check_seq() (0xc04176f4) compares it against the record
              * pointed to by msg+0xc; clearing it makes rpc_isr() discard the
-             * reply and the waiter times out -> "get dov failed".  Keep it by
-             * default; SP_IPC_DOV_KEEPSEQ=0 restores the legacy behaviour.
+             * reply and the waiter times out.  Keep it; KEEPSEQ=0 reverts.
              */
             if (!keepseq) {
                 reply[4] = 0;
@@ -2039,21 +2066,20 @@ static void sp_ipc_stub(SP8368State *s)
                           200 * 1000 * 1000);
             }
             if (dov && !hold) {
-                /* rpc_isr() picks the destination from dword2 bit15, not from
-                 * dword0 (owner).  Keep owner intact: zeroing it made the ISR
-                 * treat the forward as a bogus kernel msg and stalled boot. */
-                memcpy(fwd, usr, sizeof(fwd));
+                /* Answer the kernel waiter FIRST: it sits on the boot critical
+                 * path and must be woken immediately (1 ms and 200 ms delays
+                 * both hung the display stack).  Then, one timer tick later,
+                 * deliver the same request (bit15 clear) to the userspace fifo
+                 * so PfcDispServer sees the DOV query. */
                 address_space_write(&address_space_memory,
                                     SP_PSU_ADDR + SP_PSU_IPC_RSP,
-                                    MEMTXATTRS_UNSPECIFIED, fwd, sizeof(fwd));
-                /* The kernel waiter is on the boot critical path: it MUST be
-                 * woken almost immediately.  1 ms (and 200 ms hold) both hung
-                 * the display stack; 100 us is short enough for boot and still
-                 * separates the two blocks for the ISR. */
-                memcpy(s->ipc_pending, reply, sizeof(s->ipc_pending));
+                                    MEMTXATTRS_UNSPECIFIED, reply,
+                                    sizeof(reply));
+                memcpy(s->ipc_pending, usr, sizeof(s->ipc_pending));
                 s->ipc_pending_valid = true;
                 timer_mod(s->ipc_timer,
                           qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + 100 * 1000);
+                (void)fwd;
             } else if (hold) {
                 address_space_write(&address_space_memory,
                                     SP_PSU_ADDR + SP_PSU_IPC_RSP,
