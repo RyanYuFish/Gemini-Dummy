@@ -100,17 +100,23 @@ dart run tool/dash_up_check.dart --duration 90 --out /tmp/check.ppm
 dart run tool/dash_up_check.dart --duration 25 --shutdown      # 含关机动画采样
 ```
 
-验收值：非黑 **≈59.5%**、茶青 **≈44.8%**（待机页只有 4.37%），
-关机动画 `10.9→12.1→1.3→0.0%`，`RESULT PASS`。
+验收值（§45 之后）：非黑 **≈94.6%**、茶青 **≈44.8%**（待机页只有 ~4%，
+背景色平面此时不启用），进场动画 `4.0→91.0→…→94.6%`，
+关机动画 `10.9→12.4→2.6→0.0%`，`RESULT PASS`。
+非黑变高是 PFC 背景色平面把透明区填了底色，茶青占比恒定说明主界面元素没被动过。
 
-已知限制：**顶部状态区那条方形黑**是 OSD 透明色键下面没有背景画面 ——
-window1 / window2 背景层全空，真机由 `BackGroundFlipThread` 每帧贴背景，
-仿真里 PFC/DOV 图层引擎尚未打通（§44.3）。补电控状态不会让它消失（12 组
-组合实测顶部零变化），按实车照重绘又是明令禁止的，所以这一处仍未闭环。
-另有右下角进场动画首帧残块（§42.6）、`ambTemperature` 已喂但 P 档不上屏
-（§42.8）。OTA Update 处于引导阶段，当前 QEMU 直接加载内核，因此 OTA 模式、
+顶部状态区的方形黑条已在模型侧解决：实现 PFC 显示控制器的**背景色平面**
+（颜色从固件自己 OSD 已画出的暗色像素采样，不重绘、不合成、不引入外部位图），
+仅主界面启用；window1 若将来由固件贴了真实背景位图会自动接管。
+顺带纠正了旧结论：`PFC_DOV : get dov failed` 来自 `getBTMAC` 拼 WiFi 名，
+与显示层无关（§45.1）。
+
+已知限制：原厂镜像不含背景 `.yuv`、guest 也没有 `/dev/fb1`，所以
+window1 仍是空层（当前用的是背景**色**而非背景位图）。另有右下角进场动画
+首帧残块（§42.6）、`ambTemperature` 已喂但 P 档不上屏（§42.8）。
+OTA Update 处于引导阶段，当前 QEMU 直接加载内核，因此 OTA 模式、
 P2P 传输和虚拟 NAND 刷写尚未仿真。详细进度见
-[EMULATION.md](../docs/EMULATION.md) §24–§44。
+[EMULATION.md](../docs/EMULATION.md) §24–§45。
 
 测试：
 

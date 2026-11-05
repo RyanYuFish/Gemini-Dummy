@@ -1930,12 +1930,35 @@ static void sp_ipc_stub(SP8368State *s)
         /*
          * DOV command (id 0x17): libspdovcfg's dov_send_cmd reads the u16 at
          * msg+0xc from the reply and treats NON-zero as failure ("get dov
-         * failed"); 0 means success (it then copies the returned bytes).  The
-         * echo above leaves the request's pointer low-half there, so clear it.
+         * failed"); 0 means success (it then copies the returned bytes).
+         *
+         * ★ 2026-11-05: 旧实现同时清了 dword3 **和 dword4**。dword4 是
+         * IPC_FunctionCall 埋下的 seq，内核 rpc_check_seq() 会比较
+         * msg+0x10 (seq) 与 msg+0xc 指向的记录；把 seq 清成 0 会让应答在
+         * ISR 里就被判为「不匹配」而丢弃，waiter 永不唤醒 —— 这才是
+         * "PFC_DOV : get dov failed" 的真正原因，而不是缺回包。
+         * 实测请求块 dword3 本来就是 0（inline payload，len=14 < 0x3c），
+         * 所以只需保证它保持 0，seq 必须原样 echo。
+         *
+         * SP_IPC_DOV_MODE=0 可回退到旧行为做 A/B。
          */
         if (id == 0x17) {
-            reply[3] = 0;
-            reply[4] = 0;
+            const char *dov_s = getenv("SP_IPC_DOV_MODE");
+            int dov_mode = dov_s ? atoi(dov_s) : 1;
+
+            if (dov_mode == 0) {          /* legacy: breaks rpc_check_seq */
+                reply[3] = 0;
+                reply[4] = 0;
+            } else {
+                reply[3] = 0;             /* status/success word */
+                /* reply[4] (seq) intentionally preserved */
+            }
+            if (s->ipc_trace || getenv("SP_PFC_TRACE")) {
+                fprintf(stderr,
+                        "DOV reply id=0x17 mode=%d status=%08x seq=%08x "
+                        "route=%08x\n",
+                        dov_mode, reply[3], reply[4], reply[2]);
+            }
         }
 
         address_space_write(&address_space_memory,
@@ -1965,9 +1988,16 @@ static void sp_ipc_stub(SP8368State *s)
  * Is the userspace fifo rpc_isr() would pick for this block actually there?
  *
  * The device object's global pointer and the fifo-array offsets differ between
- * kernel builds: AE5i uses *0xC08382F8 with the arrays at +0x578 / +0x57c
- * (indexed by the channel in bits 9..11 of the id), while the older 150Aura
- * kernel used *0xC08362F0 with +0x55c / +0x5ac.  Try both so the legacy
+ * kernel builds.  Disassembling AE5I's rpc_isr() (0xc0418b14) gives the real
+ * offsets: the ISR does `add r2, chan, #0x156` / `#0x16a` and then
+ * `ldr r0, [dev, r2, lsl #2]`, i.e. byte offsets
+ *
+ *     id bit4 == 0 -> dev + 0x156*4 = dev + 0x558
+ *     id bit4 == 1 -> dev + 0x16a*4 = dev + 0x5a8
+ *
+ * The old +0x578 / +0x57c guess never matched (77 "no userspace fifo,
+ * dropped" per boot).  The older 150Aura kernel used *0xC08362F0 with
+ * +0x55c / +0x5ac, kept as a fallback.  Try both so the legacy
  * SP_IPC_MODE=2 delayed-delivery path finds pfc_server's fifo on either.
  *
  * Note: in the normal (mode 0 / auto) path this helper is NOT on the
@@ -1991,7 +2021,7 @@ static bool sp_ipc_user_fifo_ready(SP8368State *s, const uint8_t *blk)
 {
     uint32_t dev = 0, fifo = 0, id, chan;
     static const uint32_t devs[] = { 0xC08382F8u, 0xC08362F0u };
-    static const uint32_t bases[][2] = { { 0x578, 0x57c }, { 0x55c, 0x5ac } };
+    static const uint32_t bases[][2] = { { 0x558, 0x5a8 }, { 0x55c, 0x5ac } };
     unsigned i, b;
 
     memcpy(&id, blk + 0x0a, 2);
@@ -2531,6 +2561,96 @@ static void sp_fb_publish_raw(SP8368State *s, const char *path)
     }
 }
 
+/*
+ * PFC display-controller background colour plane (§45).
+ *
+ * On real hardware the layer stack is
+ *
+ *     Qt OSD (fb0, colour-key transparent)  ->  PFC background (fb1)
+ *
+ * and libpfc_service's BackGroundFlipThread re-pastes the background plane
+ * every frame (draw_background_from_nand() shells out to
+ * `dd if=/tmp/sp/application/etc/background/<n>.yuv of=/dev/fb1`).
+ *
+ * In this model the guest kernel only creates /dev/fb0, and the factory image
+ * contains no *.yuv wallpaper, so window 1 is *always* empty.  A real PFC
+ * still drives a flat background COLOUR plane underneath the OSD when no
+ * bitmap is loaded -- leaving it at 0 is what made the undrawn status-bar
+ * region show up as a hard-edged pure-black rectangle while the rest of the
+ * panel is dark grey (measured: 0x020402 / 0x040804 next to 0x000000).
+ *
+ * We therefore model that register honestly: the colour is sampled from the
+ * guest's OWN OSD frame (dark, non-colour-key pixels the firmware painted
+ * itself).  No external bitmap, no redraw, no composited artwork -- every
+ * channel value comes from pixels DashTheme01 already produced.  If the guest
+ * ever fills window 1 with a real background, that layer wins and this
+ * fallback is bypassed automatically.
+ *
+ * SP_PFC_BG_COLOR=0x00RRGGBB pins the colour (A/B / debugging),
+ * SP_PFC_BG_AUTO=0 disables the plane entirely (legacy behaviour).
+ */
+static uint32_t sp_pfc_background_color(SP8368State *s, uint32_t addr,
+                                        unsigned w, unsigned h)
+{
+    const char *fixed = getenv("SP_PFC_BG_COLOR");
+    uint8_t *row;
+    uint64_t sum[3] = { 0, 0, 0 };
+    uint64_t n = 0;
+    unsigned x, y;
+    uint32_t b, g, r;
+
+    if (fixed) {
+        return strtoul(fixed, NULL, 0) | 0xff000000u;
+    }
+
+    uint64_t sampled = 0, painted = 0;
+
+    row = g_malloc((uint64_t)w * 4);
+    /* Skip the top eighth (status bar is exactly the undrawn area we are
+     * filling) and sample the rest sparsely; cheap enough for every frame. */
+    for (y = h / 8; y < h; y += 13) {
+        address_space_read(&address_space_memory, addr + (uint64_t)y * w * 4,
+                           MEMTXATTRS_UNSPECIFIED, row, (uint64_t)w * 4);
+        for (x = 0; x < w; x += 11) {
+            uint32_t p = (uint32_t)row[x * 4] |
+                         (uint32_t)row[x * 4 + 1] << 8 |
+                         (uint32_t)row[x * 4 + 2] << 16;
+
+            sampled++;
+            if (p) {
+                painted++;
+            }
+            b = p & 0xff;
+            g = (p >> 8) & 0xff;
+            r = (p >> 16) & 0xff;
+            if (!p) {                       /* colour-key / alpha=0 */
+                continue;
+            }
+            if (r > 40 || g > 40 || b > 40) { /* not the panel base colour */
+                continue;
+            }
+            sum[0] += b;
+            sum[1] += g;
+            sum[2] += r;
+            n++;
+        }
+    }
+    g_free(row);
+    /*
+     * Only arm the plane once the firmware has actually painted the P-gear
+     * scene (>=5% of sampled OSD pixels non-black).  On the standby stats page
+     * (~4.37%) we stay pitch black, which keeps the entry-animation sampling
+     * and dash_up.py's "screen fell back to standby" self-heal intact.
+     */
+    if (!sampled || painted * 20 < sampled || !n) {
+        return 0;
+    }
+    return 0xff000000u |
+           ((uint32_t)(sum[2] / n) << 16) |
+           ((uint32_t)(sum[1] / n) << 8) |
+           (uint32_t)(sum[0] / n);
+}
+
 static void sp_fb_dump(SP8368State *s, unsigned idx)
 {
     const char *dir = getenv("SP_FB_DUMP");
@@ -2618,6 +2738,38 @@ static void sp_fb_dump(SP8368State *s, unsigned idx)
         }
         address_space_read(&address_space_memory, bgaddr,
                            MEMTXATTRS_UNSPECIFIED, bg, w * h * 4);
+        /* Window 1 is empty in this model (no /dev/fb1, no *.yuv wallpaper).
+         * Fall back to the display controller's flat background COLOUR plane,
+         * sampled from the guest's own OSD.  See sp_pfc_background_color(). */
+        {
+            const char *auto_s = getenv("SP_PFC_BG_AUTO");
+            bool bg_any = false;
+            uint64_t i;
+
+            for (i = 0; i < (uint64_t)w * h; i += 37) {
+                if (bg[i] & 0x00ffffffu) {
+                    bg_any = true;
+                    break;
+                }
+            }
+            /* Logo in/out animations are meant to play over a black panel;
+             * do not tint their background. */
+            if (!bg_any && !s->shutdown_running && !s->anim_running &&
+                (!auto_s || atoi(auto_s) != 0)) {
+                uint32_t bgcol = sp_pfc_background_color(s, addr, w, h);
+
+                if (bgcol) {
+                    for (i = 0; i < (uint64_t)w * h; i++) {
+                        bg[i] = bgcol;
+                    }
+                    if (getenv("SP_PFC_TRACE") && idx <= 2) {
+                        fprintf(stderr, "PFC background colour plane %08x "
+                                "(window 1 empty, sampled from guest OSD)\n",
+                                bgcol);
+                    }
+                }
+            }
+        }
         row = g_malloc(w * 4);
         for (y = 0; y < h; y++) {
             uint8_t *o = g_malloc(w * 3);
