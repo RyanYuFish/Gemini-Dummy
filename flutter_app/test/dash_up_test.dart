@@ -16,7 +16,8 @@ String _hex(List<int> b) =>
 int _prop(Uint8List f) =>
     ByteData.sublistView(f).getUint32(14, Endian.little);
 
-/// tools/dash_up.py 按同一顺序输出的 18 帧（2026-11-05 diff 为空）。
+/// tools/dash_up.py 按同一顺序输出的 19 帧（2026-11-05 diff 为空）。
+/// 第 19 帧是电机控制器默认状态（TCS 启用 / P 挡驻车）。
 const _reference = <String>[
   'fe5aaaa511027501010022002000021070210000000053572e312e30302e353620414535490000000000000000003ca5555a',
   'fe5aaaa51102750101000e000c0010734121000000000100000075a5555a',
@@ -36,6 +37,7 @@ const _reference = <String>[
   'fe5aaaa511027501010022002000030070210000000064000000000000002300000000000000000000000000000018a5555a',
   'fe5aaaa511027501010010000e0021717021000000001a0b05060e05f1a5555a',
   'fe5aaaa51102750101001a0018001e9570210000000001000000000000000000000000000000fea5555a',
+  'fe5aaaa51102750101001a0018001e9570210000000000000001000000000001000000000000fda5555a',
 ];
 
 List<Uint8List> _allFrames() {
@@ -51,12 +53,13 @@ List<Uint8List> _allFrames() {
     dashOdoFrame(t),
     dashTripFrame(t),
     dashPropFrame(DashProp.rtc, [26, 11, 5, 6, 14, 5]),
-    dashLampFrame(DashTelemetry(lampHex: '01'))!,
+    dashLampFrame(DashTelemetry(lampHex: '01')),
+    dashLampFrame(DashTelemetry()), // 电机控制器默认状态
   ];
 }
 
 void main() {
-  test('18 帧与 tools/dash_up.py 逐字节一致', () {
+  test('19 帧与 tools/dash_up.py 逐字节一致', () {
     final frames = _allFrames();
     expect(frames.length, _reference.length);
     for (var i = 0; i < frames.length; i++) {
@@ -96,6 +99,36 @@ void main() {
     final vi2 = dashVi2Frame(t, gear: t.gear);
     expect(vi2[26], 1); // [4] = gear
     expect(ByteData.sublistView(vi2).getUint32(30, Endian.little), 100);
+  });
+
+  test('电机控制器状态按 indicator_lamp 16B 布局编码', () {
+    final m = MotorStatus();
+    final base = m.encode();
+    expect(base.length, 16);
+    expect(base[3], 1, reason: 'TC（TCS 启用）是整字节数值字段');
+    expect(base[9] & 0x03, 1, reason: 'parking 是 byte9 bit0..1 的 2-bit 字段');
+    expect(base[1], 0, reason: 'ABS_fault 恒 0，置位会弹故障框卡住 App');
+
+    m.tc = 2; // TCS 关闭
+    m.evReady = 1;
+    m.cruiseControl = 1;
+    m.bigLight = 1;
+    m.turnLeft = 1;
+    m.turnRight = 1;
+    m.highBeam = 1;
+    final b = m.encode();
+    expect(b[3], 2);
+    expect(b[4] & 0xC0, 0x40, reason: 'EV_READY 占 byte4 bit6..7');
+    expect(b[5] & 0xC0, 0x40, reason: 'CruiseControl 占 byte5 bit6..7');
+    expect(b[11], 0x54,
+        reason: 'big_light(bit2) + turn_right(bit4) + turn_left(bit6)');
+    expect(b[12] & 0x03, 1, reason: 'high_beam 占 byte12 bit0..1');
+    expect(m.summary, contains('TCS 关闭'));
+  });
+
+  test('保持期持续上报电机控制器状态（不只是进场时发一次）', () {
+    final t = DashTelemetry();
+    expect(dashKeepFrames(t).any((f) => _prop(f) == DashProp.lampIn), isTrue);
   });
 
   test('三段式进场：pre-arm 不喂解锁 / settle 20 拍 gear=0 / enter 只一次 gear=1',

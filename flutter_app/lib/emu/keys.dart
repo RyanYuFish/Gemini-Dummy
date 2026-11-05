@@ -15,8 +15,12 @@
 //        0xd6 app_key_ota   0xd7 app_key_960
 //        0xc8/0xcf/0xc9/0xd1/0xdf 有 keyPressEvent 但没有命名动作，画面无变化。
 //
-// 所以：面板上除上/下/SET/BACK 之外的键，**在真车上本来就不经过仪表**，它们由
-// GD32 执行 → 客户端用 `McuSim` 建模（见 emu/mcu.dart），而不是往串口塞帧。
+// 所以：面板上除上/下/SET/BACK 之外的键**不作为仪表 KeyID 帧**投递；真车上
+// 由 GD32 汇总成电控/车身状态（TCS、驾驶模式、转向、远光、定速…），再经
+// `vehicle_info*` / `indicator_lamp` 上行。客户端用 `McuSim` + `MotorStatus`
+// 建模这两层状态（emu/mcu.dart、emu/dash_up.dart），由固件自己画 icon。
+// 2026-11-05 之前这些状态只停留在客户端模型里、从不上报，仪表因此收不到
+// 任何电机控制器信息。
 
 import 'mcu.dart';
 

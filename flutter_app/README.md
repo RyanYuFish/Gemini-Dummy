@@ -2,7 +2,7 @@
 
 项目最终目标是完整仿真 AE5i 仪表功能，包括画面渲染、原生按键、电源状态、蓝牙、Wi-Fi、RS-485 通讯和 OTA Update 全流程；之后基于原厂 Qt 用户态定制仪表 UI，通过仪表蓝牙连接 APT F600 读取/修改参数、读取蚂蚁 ANT BMS 与电池计量信息，并最终用 OTA Update 无线刷入实车。
 
-**当前客户端能力**：运行 AE5I 原厂 Linux-4.9.217 和 Qt Launcher，输出 1024×600 framebuffer。上电后由内置 MCU 对端（`lib/emu/dash_up.dart`）经 CFCP 喂 KL15、解锁通知与全量车辆数据，**P 档主界面（茶青背景墙 + 巨大 P + 整车 + 绿色地面 + 顶部光条 + 左列数据 + 底栏）全部由固件自己渲染**，含进场动画；所有上屏数值来自 `DashTelemetry`（电量 / 里程 / 电耗 / 续航 / 时间 / 挡位），不是离线贴图。启动时可选择 SPVD，显示启动动画和 QEMU 启动状态；上、下、SET、BACK 支持按下、长按和释放；串口日志可实时查看并导出。蓝牙/Wi-Fi/RS-485 车辆外设仿真与 OTA Update 完整刷写流程尚未实现；详细状态和验收路线见 [EMULATION.md](../docs/EMULATION.md) 文首、§37、§41–§43。
+**当前客户端能力**：运行 AE5I 原厂 Linux-4.9.217 和 Qt Launcher，输出 1024×600 framebuffer。上电后由内置 MCU 对端（`lib/emu/dash_up.dart`）经 CFCP 喂 KL15、解锁通知与全量车辆数据，**P 档主界面（茶青背景墙 + 巨大 P + 整车 + 绿色地面 + 顶部光条 + 左列数据 + 底栏）全部由固件自己渲染**，含进场动画与下电 logo-out；所有上屏数值来自 `DashTelemetry`（电量 / 里程 / 电耗 / 续航 / 时间 / 挡位），不是离线贴图。电机控制器状态（TCS / 车速 / 档位 / 驾驶模式 / 转向 / 远光 / 定速 / READY）由 `MotorStatus` 经 `indicator_lamp` + `vehicle_info*` 周期上行，把手按键可实时改写。上、下、SET、BACK 支持按下、长按和释放；串口日志可实时查看并导出。蓝牙/Wi-Fi/RS-485 车辆外设仿真与 OTA Update 完整刷写流程尚未实现；详细状态和验收路线见 [EMULATION.md](../docs/EMULATION.md) 文首、§37、§41–§44。
 
 准备自建 QEMU 和软件显示镜像：
 
@@ -69,18 +69,48 @@ open build/macos/Build/Products/Release/ae5i_emu.app
 
 全部画面元素由 guest 里原厂 `DashTheme01` 的 QGraphicsScene 绘制；上屏数值来自 `DashTelemetry`，本项目不合成、不重绘任何像素。
 
-> ⚠️ 反复写 `gear` 会让 `slot_delayUpdateGear` 重摆顶部 DRL/ECO，图标叠成双份；指示灯默认不喂（固件从不擦除旧像素，且 `ABS_fault` 会弹故障框）。
+> ⚠️ 反复写 `gear` 会让 `slot_delayUpdateGear` 重摆顶部 DRL/ECO，图标叠成双份。`indicator_lamp` 现在**恒周期上报**（`MotorStatus`），但 `ABS_fault` 位恒 0 —— 置位会弹故障框卡住 App。
+
+## 电机控制器模拟与关机动画（2026-11-05）
+
+把手上非仪表侧的按键不再只改客户端状态，而是实时改写 `MotorStatus` 并
+立即经 CFCP 上行（不等 0.5 s 心跳），由固件自己的 widget 决定如何渲染：
+
+| 按键 | 电控状态 |
+|---|---|
+| 转向 ◀ / ▶ / 双闪 | `indicator_lamp.turn_left` / `turn_right` |
+| 照明 / 超车灯 | `high_beam` / `big_light` |
+| 定速 | `CruiseControl` |
+| 加档 / 减档 | `vehicle_info3.drive_mode`（ECO / STREET / SPORT） |
+| 自定义键 | `TC`（TCS 启用 ↔ 关闭） |
+| 长按 Ready / 关机 | `EV_READY` / `parking` |
+
+客户端状态条同步显示 TCS、驾驶模式、挡位、车速与 READY。16 B 布局由
+`tools/lamp_bits.py` 逐位解出（40 个字段 / 108 个语义位），Dart 与 Python
+实现逐字节一致（19 帧 `--frames` 回归）。
+
+下电时模型先倒放 112 帧原厂 `anm_logo`（约 1.87 s），播完才发
+`poweroff -f`；客户端在 `poweringOff` 期间继续显示画面与「关机动画」提示。
 
 命令行端到端验收（纯 Dart，不依赖 Flutter UI）：
 
 ```bash
 dart run tool/dash_up_check.dart --frames                       # 帧字节与 tools/dash_up.py 逐字节比对
 dart run tool/dash_up_check.dart --duration 90 --out /tmp/check.ppm
+dart run tool/dash_up_check.dart --duration 25 --shutdown      # 含关机动画采样
 ```
 
-验收值：非黑 **≈59.5%**、茶青 **≈44.8%**（待机页只有 4.37%），`RESULT PASS`。
+验收值：非黑 **≈59.5%**、茶青 **≈44.8%**（待机页只有 4.37%），
+关机动画 `10.9→12.1→1.3→0.0%`，`RESULT PASS`。
 
-已知限制：右下角进场动画首帧残块需 PFC/DOV 背景层（§42.6）；`ambTemperature` 已喂但 P 档不上屏（§42.8）。OTA Update 处于引导阶段，当前 QEMU 直接加载内核，因此 OTA 模式、P2P 传输和虚拟 NAND 刷写尚未仿真。详细进度见 [EMULATION.md](../docs/EMULATION.md) §24–§43。
+已知限制：**顶部状态区那条方形黑**是 OSD 透明色键下面没有背景画面 ——
+window1 / window2 背景层全空，真机由 `BackGroundFlipThread` 每帧贴背景，
+仿真里 PFC/DOV 图层引擎尚未打通（§44.3）。补电控状态不会让它消失（12 组
+组合实测顶部零变化），按实车照重绘又是明令禁止的，所以这一处仍未闭环。
+另有右下角进场动画首帧残块（§42.6）、`ambTemperature` 已喂但 P 档不上屏
+（§42.8）。OTA Update 处于引导阶段，当前 QEMU 直接加载内核，因此 OTA 模式、
+P2P 传输和虚拟 NAND 刷写尚未仿真。详细进度见
+[EMULATION.md](../docs/EMULATION.md) §24–§44。
 
 测试：
 

@@ -797,10 +797,21 @@ class _EmuPageState extends State<EmuPage> with SingleTickerProviderStateMixin {
                             c.displayLit,
                             c.displayPaintedPct,
                             c.animating,
+                            c.shutdownAnimating,
                           ]),
                           builder: (_, _) {
                             if (c.vehicle.passwordMode) {
                               return const SizedBox.shrink();
+                            }
+                            // 下电时面板仍在亮着：先播原厂 logo-out，别用
+                            // 「开机动画」文案，也别让待机占位盖住画面。
+                            if (c.shutdownAnimating.value) {
+                              return _displayHint(
+                                '关机动画 · 原厂 logo out',
+                                '模型倒放 anm_logo 的 112 帧；播完后 guest '
+                                    'poweroff 才把面板变黑',
+                                accent: true,
+                              );
                             }
                             if (c.animating.value) {
                               return _displayHint(
@@ -1418,79 +1429,82 @@ class _EmuPageState extends State<EmuPage> with SingleTickerProviderStateMixin {
     );
   }
 
-  /// 模拟 MCU 的车身状态条：这些键在真车上由 GD32 执行，不经过仪表。
+  /// 电机控制器（电控）+ GD32 车身状态条。
   ///
-  /// ⚠ 方向更正（2026-11-02）：**上行（MCU→SoC）车辆信号帧格式尚未解出**，
-  /// 所以这里的语义状态暂时只体现在本地模型上，尚未真正驱动集群画面
-  /// （实测把 11 个候选属性 × sub 0..4 共 55 组写进 guest，framebuffer 变化
-  /// 恒为 0 —— 下行属性帧不是驱动源，见 EMULATION.md §29）。
-  /// 右侧同时显示 **guest（SoC）广播回来的仪表真实状态**，那才是集群现在的样子。
+  /// 2026-11-05：上行状态链路已闭环。按键 / 整车状态机改写 `DashTelemetry`
+  /// 与 `MotorStatus`，经 `vehicle_info1/2/3` + `indicator_lamp` 上行，
+  /// 由 guest 原厂 widget 自己渲染；这里只做观测，不画任何像素。
   Widget _mcuStateBar() {
-    return ValueListenableBuilder<McuState>(
-      valueListenable: c.mcu.state,
-      builder: (_, s, _) {
-        return ValueListenableBuilder<ClusterPeerState>(
-          valueListenable: c.clusterState,
-          builder: (_, peer, _) {
-            return Row(
-              children: [
-                const Text(
-                  '模拟 MCU 车身',
-                  style: TextStyle(fontSize: 10, color: Color(0xFF7E8894)),
-                ),
-                const SizedBox(width: 8),
-                _mcuChip('左转 ◀', s.leftLamp, const Color(0xFFFFC978)),
-                _mcuChip('右转 ▶', s.rightLamp, const Color(0xFFFFC978)),
-                _mcuChip('双闪', s.hazard, const Color(0xFFFFC978)),
-                _mcuChip('远光', s.highBeam, const Color(0xFF7FB2FF)),
-                _mcuChip('定速', s.cruise, const Color(0xFF3DDC97)),
-                const SizedBox(width: 6),
-                _peerChip('SoC 灯态', peer.lampMask),
-                _peerChip('SoC 档位', peer.gear),
-                _peerChip('SoC 状态', peer.status),
-                const SizedBox(width: 4),
-                Expanded(
-                  child: Text(
-                    'SoC 广播：${peer.mcuLinkUp ? "已握手" : "未握手"}'
-                    ' 心跳×${peer.heartbeatCount}'
-                    '（上行车辆信号帧待解，见 EMULATION.md §29）',
-                    style: const TextStyle(
-                      fontSize: 9.5,
-                      color: Color(0xFF6B7580),
-                    ),
-                    overflow: TextOverflow.ellipsis,
+    return ValueListenableBuilder<int>(
+      valueListenable: c.motorRevision,
+      builder: (_, _, _) => ValueListenableBuilder<McuState>(
+        valueListenable: c.mcu.state,
+        builder: (_, s, _) {
+          return ValueListenableBuilder<ClusterPeerState>(
+            valueListenable: c.clusterState,
+            builder: (_, peer, _) {
+              final t = c.telemetry;
+              final m = t.motor;
+              return Row(
+                children: [
+                  const Text(
+                    '电控 / 车身',
+                    style: TextStyle(fontSize: 10, color: Color(0xFF7E8894)),
                   ),
-                ),
-              ],
-            );
-          },
-        );
-      },
+                  const SizedBox(width: 8),
+                  _mcuChip('左转 ◀', s.leftLamp, const Color(0xFFFFC978)),
+                  _mcuChip('右转 ▶', s.rightLamp, const Color(0xFFFFC978)),
+                  _mcuChip('双闪', s.hazard, const Color(0xFFFFC978)),
+                  _mcuChip('远光', s.highBeam, const Color(0xFF7FB2FF)),
+                  _mcuChip('定速', s.cruise, const Color(0xFF3DDC97)),
+                  const SizedBox(width: 6),
+                  _infoChip('TCS ${m.tc == 1 ? 'ON' : 'OFF'}'),
+                  _infoChip(_modeLabel(t.driveMode)),
+                  _infoChip('${t.gear == 1 ? 'P 挡' : '挡位 ${t.gear}'}'
+                      ' · ${t.speed} km/h'),
+                  if (m.evReady > 0) _infoChip('READY'),
+                  const SizedBox(width: 4),
+                  Expanded(
+                    child: Text(
+                      '${peer.mcuLinkUp ? '已握手' : '未握手'}'
+                      ' 心跳×${peer.heartbeatCount} · ${m.summary}'
+                      ' · 经 vehicle_info*/indicator_lamp 上行',
+                      style: const TextStyle(
+                        fontSize: 9.5,
+                        color: Color(0xFF6B7580),
+                      ),
+                      overflow: TextOverflow.ellipsis,
+                    ),
+                  ),
+                ],
+              );
+            },
+          );
+        },
+      ),
     );
   }
 
-  /// 显示 guest（SoC）广播回来的属性值（十六进制）。
-  Widget _peerChip(String label, int? value) {
-    final has = value != null;
-    return Container(
-      margin: const EdgeInsets.only(right: 5),
-      padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
-      decoration: BoxDecoration(
-        color: has ? const Color(0xFF1D2A24) : const Color(0xFF20262C),
-        border: Border.all(
-          color: has ? const Color(0xFF2F5D46) : const Color(0xFF2C333B),
-        ),
-        borderRadius: BorderRadius.circular(4),
-      ),
-      child: Text(
-        has ? '$label ${value.toRadixString(16)}' : '$label —',
-        style: TextStyle(
-          fontSize: 9.5,
-          color: has ? const Color(0xFF6FD3A0) : const Color(0xFF5A636D),
-        ),
-      ),
-    );
-  }
+  String _modeLabel(int mode) => switch (mode) {
+    1 => 'ECO',
+    2 => 'STREET',
+    3 => 'SPORT',
+    _ => '模式$mode',
+  };
+
+  Widget _infoChip(String text) => Container(
+    margin: const EdgeInsets.only(right: 5),
+    padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+    decoration: BoxDecoration(
+      color: const Color(0xFF1A2630),
+      border: Border.all(color: const Color(0xFF34536B)),
+      borderRadius: BorderRadius.circular(4),
+    ),
+    child: Text(
+      text,
+      style: const TextStyle(fontSize: 9.5, color: Color(0xFF8FC4F5)),
+    ),
+  );
 
   Widget _mcuChip(String label, bool on, Color color) {
     return Container(

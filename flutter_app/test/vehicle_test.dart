@@ -359,4 +359,31 @@ void main() {
       expect(m.state, VehicleState.unlocked);
     });
   });
+
+  group('下电动画可见性', () {
+    test('poweringOff 期间面板仍在显示（不能被待机占位盖住 logo-out）', () {
+      final m = VehicleMachine()
+        ..bleConnected = true
+        ..tboxOnline = true;
+      m.dispatch(VehicleEvent.powerOn);
+      m.dispatch(VehicleEvent.bootReady);
+      m.dispatch(VehicleEvent.appUnlock);
+      m.dispatch(VehicleEvent.longPressReady);
+      expect(m.state, VehicleState.ready);
+      expect(m.state.isAwake, isTrue);
+
+      final d = m.dispatch(VehicleEvent.longPressReady);
+      expect(d.effect, VehicleEffect.stopGuest);
+      expect(m.state, VehicleState.poweringOff);
+      // 2026-11-05 修复：旧实现漏了 poweringOff，一点下电 UI 就用
+      // _clusterStandby 盖住画面，模型倒放的原厂 logo 完全看不见。
+      expect(m.state.isAwake, isTrue,
+          reason: '关机动画播完前面板必须继续显示 framebuffer');
+      expect(m.state.isPowered, isTrue);
+
+      m.dispatch(VehicleEvent.guestPowerDown);
+      expect(m.state, VehicleState.poweredOff);
+      expect(m.state.isAwake, isFalse);
+    });
+  });
 }

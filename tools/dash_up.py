@@ -125,6 +125,73 @@ def sync_frame(unlock=True):
     return prop_frame(PROP_SYNC, 0, bytes(b))
 
 
+# ---------------------------------------------------------------- 电机控制器
+# 2-bit 字段表：name -> (byte, bit0)。由「单 bit 载荷 + 固件日志 diff」实测
+# （tools/lamp_bits.py，108 个语义位 / 40 个字段）。byte0..3 是整字节数值
+# 字段 ABS_off / ABS_fault / camera / TC，byte15 未解出保持 0。
+# 必须与 flutter_app/lib/emu/dash_up.dart 的 MotorStatus.encode() 逐字节一致。
+LAMP_FIELDS = {
+    'ota_not_regist': (4, 0), 'vin_not_write': (4, 2),
+    'side_stand': (4, 4), 'ev_ready': (4, 6),
+    'auto_start_stop': (5, 2), 'engine_kill': (5, 4),
+    'cruise_control': (5, 6),
+    'wind_wing': (6, 0), 'auto_lamp': (6, 6),
+    'downhill': (7, 0), 'power_limiting': (7, 2),
+    'power_battery_fault': (7, 4), 'power_battery_cut_off': (7, 6),
+    'low_brake_fluid': (8, 0), 'discharging': (8, 2),
+    'charging': (8, 4), 'electricity_connect': (8, 6),
+    'parking': (9, 0), 'boosting': (9, 2),
+    'low_engine_oil': (9, 4), 'eps_fault': (9, 6),
+    'low_voltage': (10, 0), 'low_charge': (10, 2),
+    'battery_fault': (10, 4), 'opc_alarm': (10, 6),
+    'pos_light': (11, 0), 'big_light': (11, 2),
+    'turn_right': (11, 4), 'turn_left': (11, 6),
+    'high_beam': (12, 0), 'reverse_assist_power': (12, 2),
+    'promotion_assist': (12, 4), 'engine_fault': (12, 6),
+    'rcw_warn_status': (13, 0), 'bluetooth_key': (13, 2),
+    'seat_cushion_lock_control': (13, 4),
+    'turtle_speed_driving_light': (13, 6),
+    'bsd_status': (14, 6),
+}
+
+
+class MotorStatus:
+    """电机控制器（电控 MCU）上报的车辆状态。
+
+    `TC` = TCS 启用与否；`parking` / `ev_ready` / `turn_*` / `high_beam` /
+    `cruise_control` 是档位与把手按键对应的状态 icon 源。本类只产生状态
+    字节，icon 一律由 guest 原厂 widget 自己画。
+    """
+
+    def __init__(self, tc=1, parking=1, **kw):
+        self.abs_off = 0
+        self.abs_fault = 0       # 恒 0：置位会弹 ABS 故障框卡住 App
+        self.camera = 0
+        self.tc = tc
+        for name in LAMP_FIELDS:
+            setattr(self, name, 0)
+        self.parking = parking
+        for k, v in kw.items():
+            if not hasattr(self, k):
+                raise KeyError('unknown motor status field: %s' % k)
+            setattr(self, k, v)
+
+    def encode(self):
+        b = bytearray(16)
+        b[0] = self.abs_off & 0xFF
+        b[1] = self.abs_fault & 0xFF
+        b[2] = self.camera & 0xFF
+        b[3] = self.tc & 0xFF
+        for name, (byte, bit0) in LAMP_FIELDS.items():
+            b[byte] |= (getattr(self, name, 0) & 3) << bit0
+        return bytes(b)
+
+
+def motor_lamp_frame(m):
+    """把电机控制器状态打包成 indicator_lamp 属性帧。"""
+    return prop_frame(PROP_LAMP_IN, 0, m.encode())
+
+
 def lamp_frame(hexstr):
     """indicator_lamp: 16 B 指示灯位图（MCU 上行 → 固件画顶部指示灯区）。
 
@@ -311,8 +378,11 @@ def main():
                          ' --range 100，但底栏会有残影。')
     ap.add_argument('--drive-mode', type=int, default=1, help='1=ECO 2=STREET 3=SPORT')
     ap.add_argument('--lamps', default='',
-                    help='指示灯位图（16B hex）。00=全灭；01=byte0 bit0=ABS_off '
-                         '(实车照里那个 (ABS) 带斜杠图标)。见 tools/lamp_bits.py')
+                    help='诊断用：直接指定 indicator_lamp 的 16B hex，覆盖电控状态')
+    ap.add_argument('--tcs', type=int, default=1, choices=[0, 1, 2],
+                    help='电机控制器上报的 TCS 状态：1=启用 2=关闭（默认 1）')
+    ap.add_argument('--no-motor', action='store_true',
+                    help='对照组：不喂电机控制器状态帧（2026-11-05 之前的旧行为）')
     ap.add_argument('--odo', type=int, default=5060, help='总里程，0.1 km 单位')
     ap.add_argument('--avg-power', type=int, default=287, help='平均电耗，0.1 Wh/km')
     ap.add_argument('--trip', type=int, default=100, help='单次里程，0.1 km 单位')
@@ -337,7 +407,16 @@ def main():
                           bytes([t.tm_year % 100, t.tm_mon, t.tm_mday,
                                  t.tm_hour, t.tm_min, t.tm_sec]))
 
-    lamp_f = lamp_frame(args.lamps)
+    # 电机控制器状态：真车从第一拍起就周期上报 TCS / READY / 驻车 / 灯态，
+    # 不能因为「暂时没有 icon 要显示」就整帧不发（旧版正是这样，导致仪表
+    # 收不到任何电控状态）。--lamps 用于逐位诊断覆盖，--no-motor 做对照。
+    motor = MotorStatus(tc=args.tcs)
+    lamp_override = lamp_frame(args.lamps)
+
+    def lamp_now():
+        if lamp_override is not None:
+            return lamp_override
+        return None if args.no_motor else motor_lamp_frame(motor)
 
     rtc_frame = None
     if args.rtc == 'auto':
@@ -406,12 +485,13 @@ def main():
         p.send(rtc_frame)
     time.sleep(0.4)
     p.pump()
-    # 指示灯放在进场动画之后再送：提前送会让 App 重建场景并重画占位文字
-    # （"骑行获得数据~" 压在真值下面）。动画跑完再送，图标一次画到位。
-    if lamp_f is not None:
-        time.sleep(2.5)
-        p.pump()
-        p.send(lamp_f)
+    # 电控状态放在进场动画之后再送：提前送会让 App 重建场景并重画占位文字
+    # （"骑行获得数据~" 压在真值下面）。动画跑完再送，状态一次到位。
+    time.sleep(2.5)
+    p.pump()
+    f = lamp_now()
+    if f is not None:
+        p.send(f)
         time.sleep(0.6)
         p.pump()
 
@@ -429,6 +509,9 @@ def main():
         if now - last > 0.5:              # 心跳 / KL15 / 数据 保持（挡位不重复发！）
             p.send(prop_u32(PROP_KL15, args.kl15))
             p.send(prop_u32(PROP_HEARTBEAT, 0))
+            lamp_keep = lamp_now()        # 电控：TCS / READY / 驻车 / 灯态周期上报
+            if lamp_keep is not None:
+                p.send(lamp_keep)
             p.send(vi1_frame(args.speed, 0, args.rpm, args.temp))
             p.send(vi3_frame(drive_mode=args.drive_mode, battery=args.soc))
             p.send(batt_frame(args.soc))

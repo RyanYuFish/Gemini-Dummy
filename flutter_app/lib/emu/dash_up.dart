@@ -55,10 +55,143 @@ class DashProp {
   static const int capability = 0x27407404;
 }
 
+/// 电机控制器（电控 MCU）上报的**车辆状态**，对应 `indicator_lamp`
+/// (`0x2170951e`, 16 B)。
+///
+/// 字段布局由「单 bit 载荷 + 固件日志 diff」逐位解出（tools/lamp_bits.py，
+/// 2026-11-05，108 个语义位 / 40 个字段）：
+///   * byte0..3 各是一个**整字节数值**字段：ABS_off / ABS_fault / camera / TC；
+///   * byte4..14 每字节装 4 个 **2-bit 字段**（0=灭 1=亮 2=告警），
+///     编码为 `value << bit0`；
+///   * byte15 未解出，保持 0。
+///
+/// `TC` 就是用户说的「TCS 启用与否」；`parking`/`EV_READY`/`turn_*`/
+/// `high_beam`/`CruiseControl` 是档位与把手按键对应的状态 icon 源。
+///
+/// ⚠ `ABS_fault` 置位会弹故障框卡住 App，恒 0。本类只产生状态字节，
+/// **不画任何像素**；icon 一律由 guest 原厂 widget 自己渲染。
+class MotorStatus {
+  MotorStatus({this.tc = 1, this.parking = 1});
+
+  // ---- byte0..3：整字节数值字段 ----
+  int absOff = 0;
+  int absFault = 0; // 恒 0：置位会弹故障框
+  int camera = 0;
+
+  /// TCS 状态：1 = 启用，2 = 关闭（顶部 TC-off 图标）。
+  int tc;
+
+  // ---- byte4..14：2-bit 字段（0 / 1 / 2）----
+  int otaNotRegist = 0;
+  int vinNotWrite = 0;
+  int sideStand = 0;
+  int evReady = 0;
+  int autoStartStop = 0;
+  int engineKill = 0;
+  int cruiseControl = 0;
+  int windWing = 0;
+  int autoLamp = 0;
+  int downhill = 0;
+  int powerLimiting = 0;
+  int powerBatteryFault = 0;
+  int powerBatteryCutOff = 0;
+  int lowBrakeFluid = 0;
+  int discharging = 0;
+  int charging = 0;
+  int electricityConnect = 0;
+  int parking;
+  int boosting = 0;
+  int lowEngineOil = 0;
+  int epsFault = 0;
+  int lowVoltage = 0;
+  int lowCharge = 0;
+  int batteryFault = 0;
+  int opcAlarm = 0;
+  int posLight = 0;
+  int bigLight = 0;
+  int turnRight = 0;
+  int turnLeft = 0;
+  int highBeam = 0;
+  int reverseAssistPower = 0;
+  int promotionAssist = 0;
+  int engineFault = 0;
+  int rcwWarnStatus = 0;
+  int bluetoothKey = 0;
+  int seatCushionLockControl = 0;
+  int turtleSpeedDrivingLight = 0;
+  int bsdStatus = 0;
+
+  void _set2(Uint8List b, int byte, int bit0, int value) =>
+      b[byte] = (b[byte] | ((value & 3) << bit0)) & 0xFF;
+
+  Uint8List encode() {
+    final b = _buf(16);
+    b[0] = absOff & 0xFF;
+    b[1] = absFault & 0xFF;
+    b[2] = camera & 0xFF;
+    b[3] = tc & 0xFF;
+    _set2(b, 4, 0, otaNotRegist);
+    _set2(b, 4, 2, vinNotWrite);
+    _set2(b, 4, 4, sideStand);
+    _set2(b, 4, 6, evReady);
+    _set2(b, 5, 2, autoStartStop);
+    _set2(b, 5, 4, engineKill);
+    _set2(b, 5, 6, cruiseControl);
+    _set2(b, 6, 0, windWing);
+    _set2(b, 6, 6, autoLamp);
+    _set2(b, 7, 0, downhill);
+    _set2(b, 7, 2, powerLimiting);
+    _set2(b, 7, 4, powerBatteryFault);
+    _set2(b, 7, 6, powerBatteryCutOff);
+    _set2(b, 8, 0, lowBrakeFluid);
+    _set2(b, 8, 2, discharging);
+    _set2(b, 8, 4, charging);
+    _set2(b, 8, 6, electricityConnect);
+    _set2(b, 9, 0, parking);
+    _set2(b, 9, 2, boosting);
+    _set2(b, 9, 4, lowEngineOil);
+    _set2(b, 9, 6, epsFault);
+    _set2(b, 10, 0, lowVoltage);
+    _set2(b, 10, 2, lowCharge);
+    _set2(b, 10, 4, batteryFault);
+    _set2(b, 10, 6, opcAlarm);
+    _set2(b, 11, 0, posLight);
+    _set2(b, 11, 2, bigLight);
+    _set2(b, 11, 4, turnRight);
+    _set2(b, 11, 6, turnLeft);
+    _set2(b, 12, 0, highBeam);
+    _set2(b, 12, 2, reverseAssistPower);
+    _set2(b, 12, 4, promotionAssist);
+    _set2(b, 12, 6, engineFault);
+    _set2(b, 13, 0, rcwWarnStatus);
+    _set2(b, 13, 2, bluetoothKey);
+    _set2(b, 13, 4, seatCushionLockControl);
+    _set2(b, 13, 6, turtleSpeedDrivingLight);
+    _set2(b, 14, 6, bsdStatus);
+    return b;
+  }
+
+  /// 一行摘要，给日志 / 客户端状态条用。
+  String get summary {
+    final on = <String>[
+      if (tc == 2) 'TCS 关闭' else if (tc == 1) 'TCS 启用',
+      if (evReady > 0) 'READY',
+      if (parking > 0) 'P 挡驻车',
+      if (turnLeft > 0) '左转',
+      if (turnRight > 0) '右转',
+      if (highBeam > 0) '远光',
+      if (bigLight > 0) '大灯',
+      if (cruiseControl > 0) '定速',
+    ];
+    return on.isEmpty ? '电控无状态位' : on.join(' / ');
+  }
+}
+
 /// MCU 遥测数据源。
 ///
-/// 这就是「MCU 仿真器」里的车辆数据：所有上屏数值都从这里经 CFCP 上行送给
-/// 固件，由固件自己的 widget 渲染。改这里的值即可改变仪表显示（而不是重绘）。
+/// 这就是「电机控制器 + BMS 仿真器」里的车辆数据：车速 / 档位 / 驾驶模式 /
+/// TCS / 灯态全部从这里经 CFCP 上行送给固件，由固件自己的 widget 渲染。
+/// 改这里的值即可改变仪表显示（而不是重绘）。
 ///
 /// 默认值取自 dash_up.py 的实车样本：电量 91%、总里程 506.0 km、
 /// 平均电耗 28.7 Wh/km、单次里程 10.0 km、ECO 模式、P 挡。
@@ -122,10 +255,14 @@ class DashTelemetry {
   int battCurrent;
   int chargingTime;
 
-  /// indicator_lamp 16 B 位图（hex）。
+  /// 电机控制器状态（TCS / READY / 驻车 / 转向 / 远光 / 定速 …）。
   ///
-  /// 默认空 = **不喂**。固件从不擦除旧像素，灯只能加不能减；且 ABS_fault
-  /// 会弹故障框卡住 App。要在进场动画之后才喂一次。
+  /// 2026-11-05 补齐：旧版默认**整个属性都不喂**，仪表收不到任何电控状态，
+  /// 顶部状态区因此没有 icon 可画。现在进场动画跑完后恒上报，并由把手
+  /// 按键实时改写（[DashUpFeeder.motorChanged]）。
+  final motor = MotorStatus();
+
+  /// 可选的 16 B hex 覆盖（诊断用）。空 = 使用 [motor] 的语义状态。
   String lampHex;
 
   /// true = RTC 跟随宿主机本地时间（只在分钟翻页时重发）。
@@ -242,10 +379,14 @@ Uint8List dashRtcFrame(DashTelemetry t) {
   ]);
 }
 
-/// indicator_lamp (16 B)。hex 为空时返回 null（默认不喂，避免固件留下残灯）。
-Uint8List? dashLampFrame(DashTelemetry t) {
+/// indicator_lamp (16 B)：电机控制器状态位。
+///
+/// 默认取 [DashTelemetry.motor] 的语义状态（TCS / 档位 / 灯态 …）；
+/// `lampHex` 非空时用于逐位诊断覆盖。**恒返回一帧** —— 真车电控从第一拍
+/// 起就在周期上报状态，不能因为「暂时没有 icon 要显示」就整帧不发。
+Uint8List dashLampFrame(DashTelemetry t) {
   var s = t.lampHex.replaceAll(' ', '');
-  if (s.isEmpty) return null;
+  if (s.isEmpty) return dashPropFrame(DashProp.lampIn, t.motor.encode());
   if (s.length.isOdd) s = '0$s';
   final data = _buf(16);
   for (var i = 0; i < 16 && i * 2 + 1 < s.length; i++) {
@@ -280,9 +421,14 @@ List<Uint8List> dashDataFrames(DashTelemetry t, {required int gear}) => [
 ];
 
 /// 保持期每 0.5 s 的心跳/数据（**绝不重复写挡位**）。
+///
+/// 包含 `indicator_lamp`：真车电机控制器按周期上报 TCS / READY / 灯态，
+/// 不是「有变化才发一帧」。P 档场景是否把某个 icon 画到屏幕由固件决定，
+/// 但链路这一侧必须始终有完整状态。
 List<Uint8List> dashKeepFrames(DashTelemetry t) => [
   dashU32Frame(DashProp.kl15, t.kl15),
   dashU32Frame(DashProp.heartbeat, 0),
+  dashLampFrame(t),
   dashVi1Frame(t),
   dashVi3Frame(t),
   dashBattFrame(t),
@@ -358,6 +504,21 @@ class DashUpFeeder {
   void stop() {
     _stopped = true;
     _setPhase(DashUpPhase.stopped, 'MCU 对端停止');
+  }
+
+  /// 电机控制器状态变化：立刻补一拍状态帧，不等 0.5 s 心跳周期。
+  ///
+  /// 链路：把手按键 / 解锁 / Ready → `McuSim` → `QemuController` 同步
+  /// [telemetry] 与 `telemetry.motor` → 这里立即上行 → 固件 widget 自己重画。
+  /// 不写 `vehicle_info2.gear`（反复写会重摆顶部 item 造成图标重影）。
+  Future<void> motorChanged() async {
+    if (_stopped || !entered) return;
+    await _sendAll([
+      dashLampFrame(telemetry),
+      dashVi1Frame(telemetry),
+      dashVi3Frame(telemetry),
+      dashBattFrame(telemetry),
+    ]);
   }
 
   void _setPhase(DashUpPhase p, String msg) {
@@ -443,14 +604,12 @@ class DashUpFeeder {
     await _send(dashVi2Frame(telemetry, gear: telemetry.gear));
     await _send(dashRtcFrame(telemetry));
     await _sleep(const Duration(milliseconds: 400));
-    // 指示灯必须等进场动画跑完再喂（提前喂会让 App 重建场景，把
-    // "骑行获得数据~" 占位文字压在真值下面）。默认 lampHex 为空 = 不喂。
-    final lamp = dashLampFrame(telemetry);
-    if (lamp != null) {
-      await _sleep(const Duration(milliseconds: 2500));
-      await _send(lamp);
-      await _sleep(const Duration(milliseconds: 600));
-    }
+    // 电控状态必须等进场动画跑完再喂（提前喂会让 App 重建场景，把
+    // "骑行获得数据~" 占位文字压在真值下面）。动画结束后第一拍就把
+    // TCS / READY / 驻车 / 灯态全量上报，此后由 heart beat 持续维持。
+    await _sleep(const Duration(milliseconds: 2500));
+    await _send(dashLampFrame(telemetry));
+    await _sleep(const Duration(milliseconds: 600));
     entered = true;
     _setPhase(DashUpPhase.hold, 'P 档主界面由固件自身渲染完成，进入保持/自愈');
   }

@@ -3768,3 +3768,113 @@ RESULT PASS
   改为上电即播 logo。
 * §42.6 的 PFC/DOV 背景层、§42.7 指示灯默认不喂、§42.8 环境温度不上屏，
   这些已知限制不变。
+
+## 44. 关机动画遮挡 / 电机控制器模拟 / 顶部黑条归因（2026-11-05 下午）
+
+三条反馈：① 点「停止 / 下电」看不到关机动画；② 除上/下/SET/BACK 之外
+的按键几乎无效，仪表没收到 TCS、车速、车辆档位等电控状态；③ 顶部有一条
+方形黑色 —— 真车没接电机控制器时，那些 icon 位置应该是**透明的**。
+
+### 44.1 关机动画：模型一直在播，是客户端遮挡
+
+取证（单连接探针 + `SP_SHUTDOWN_WAKE_FILE` + `SP_SHUTDOWN_TRACE=1`）：
+
+```
+SHUTANIM: 1024x600 112 frames @ 60 fps (reverse) from .../anm_logo.bin
+SHUTANIM: frame 0/112 … frame 111/112 … done, 112 frames (logo out)
+painted: 58.30%（P 档）→ 11.01%（logo 可见）→ 0%（面板熄灭）
+```
+
+模型侧 `sp_shutdown_start()` / `sp_shutdown_tick()` 完全正常。真正原因是
+`VehicleStateX.isAwake` 只含 `unlocked / ready`：一点下电就变 `poweringOff`，
+`main.dart` 的画面组件立刻用 `_clusterStandby()` 盖住整个画面，一帧都看不见。
+
+修法：
+
+* `vehicle.dart`：`isAwake` 加入 `poweringOff`（logo-out 播完前面板仍亮）。
+* `controller.dart`：新增 `shutdownAnimating`；把动画触发从
+  `_sendShutdownCommand()`（要求 `_consoleReady`，而 `root@AE5I:/#` 只在启动
+  早期出现一次、随后被 `_serialTail` 冲掉）里拆出来，改由
+  `_gracefulShutdown()` 直接调 `_startShutdownAnimation()`：写触发文件 →
+  置 `animating`（保持高频抓帧）→ 2.2 s 后才发 `poweroff -f`。
+* `main.dart`：下电期间显示「关机动画 · 原厂 logo out」，不再盖画面。
+* `tool/dash_up_check.dart --shutdown`：端到端采样 24 帧并纳入 `RESULT PASS`。
+
+### 44.2 电机控制器（电控 MCU）模拟：补齐上行状态
+
+用户澄清：「仪表没有收到仿真的电机控制器返回的任何车辆状态信息，例如
+TCS 启用与否、车速、车辆档位等，因此没有显示对应 icon 所代表的状态」。
+
+根因：`dash_up.py` / `dash_up.dart` 的 `indicator_lamp`（`0x2170951e`,
+16 B）**默认整帧不喂**（旧注释「固件从不擦除旧像素，灯只能加不能减」），
+`McuSim` 的把手按键也只改客户端状态、从不上行。
+
+先用「单 bit 载荷 + 固件日志 diff」把 16 B 布局完整解出（108 个语义位 /
+40 个字段，见 `tools/lamp_bits.py`）：
+
+| 字节 | 字段（每字节 4 个 2-bit 字段，0=灭 / 1=亮 / 2=告警） |
+|---|---|
+| byte0..3 | **整字节数值**：`ABS_off` / `ABS_fault` / `camera` / **`TC`（TCS）** |
+| byte4 | `OTA_not_regist` / `vin_not_write` / `sideStand` / `EV_READY` |
+| byte5 | `auto_start_stop` / `engine_kill` / **`CruiseControl`** |
+| byte9 | **`parking`** / `boosting` / `low_engline_oil` / `eps_fault` |
+| byte11 | `pos_light` / `big_light` / **`turn_right` / `turn_left`** |
+| byte12 | **`high_beam`** / `reverse_assist_power` / `promotion_assist` / `engine_fault` |
+| 其余 | `charging` / `low_voltage` / `bsd_status` / `bluetooth_key` / `rcw_warn_status` … |
+
+编码 `value << bit0`；byte15 未解出保持 0；`ABS_fault` 置位会弹故障框卡住
+App，恒 0。
+
+实现：
+
+* 新增纯 Dart `MotorStatus`（`lib/emu/dash_up.dart`）与 Python 对等的
+  `MotorStatus` / `LAMP_FIELDS`（`tools/dash_up.py`），逐字节一致。
+* `dashLampFrame()` 改为**恒返回一帧**（默认 TCS 启用 + P 挡驻车），
+  `dashKeepFrames()` 每 0.5 s 周期上报；进场动画结束后先补一拍。
+* `DashUpFeeder.motorChanged()`：状态变化立即补一拍，不等心跳；**不写
+  `vehicle_info2.gear`**（§41.4，反复写会让顶部 DRL/ECO 图标叠成双份）。
+* 按键接线：转向/双闪 → `turn_left/right`；远光 → `high_beam` + `big_light`；
+  定速 → `CruiseControl`；加/减档 → `vehicle_info3.drive_mode`
+  (1=ECO / 2=STREET / 3=SPORT)；自定义键 → `TC`；整车 READY 状态机切换
+  `EV_READY` / `parking`。客户端状态条新增 TCS / 模式 / 挡位 / 车速 / READY。
+* 帧字节回归：Dart 与 Python 同序 **19 帧 `diff` 为空**；
+  `test/dash_up_test.dart` 固化 16 B 布局、保持期恒上报、三段式进场三条红线；
+  `test/vehicle_test.dart` 固化「poweringOff 期间面板仍可见」。
+
+### 44.3 顶部方形黑条：透明处露出的是空的 PFC 背景层（未闭环）
+
+用户定性为渲染问题：「对应 icon 的位置不是黑色，而是透明的」。取证：
+
+| 证据 | 结果 |
+|---|---|
+| `monitor xp` 读 OSD 顶部像素 | `00 00 00 ff`（BGRA，**不透明**纯黑，alpha=255） |
+| `SP_FB_BG_DUMP` 导 window1 / window2 | 两层 **0.00% 非黑**（全空） |
+| `sp_fb_dump` 的 `SP_FB_COMPOSITE` 分支 | `(osdpx & 0x00ffffff) ? osdpx : bg[window1]`：纯黑被当作透明色键，回落到空背景层 ⇒ 仍是黑 |
+| 逐个喂 `indicator_lamp` 40 字段 / gear 0..3 / speed 0..80 / drive_mode 0..3 / `EV_READY` | 顶部 y<90 非黑恒 **4.7%**，零变化 |
+| 同期串口 | `切换挡位: 0` / `update_speed_data: 0, 0` / `slots_lamp_abs_off: 0` 均有 ⇒ **帧已被 handler 消费**，是 P 档场景没把状态 icon 画到屏幕 |
+
+结论：那块黑不是「缺图标留下的空位」，而是 **OSD 透明色键下面没有背景
+画面**。真机此处由 `libpfc_service` 的 `BackGroundFlipThread` 每帧把背景
+位图贴到 PFC 背景层（window1）；仿真里这条链路正是 §42.6 记的
+`PFC_DOV : get dov failed`（VPP/DOV 图层引擎未打通）。所以：
+
+* 补电控状态**不能**让它消失（12 组组合实测顶部零变化），但状态链本身
+  已按用户要求补齐（§44.2）；
+* 按实车照重绘 / 离线合成是用户明令禁止的；
+* 正解是打通 VPP/DOV 背景层，让固件自己的背景位图出现在 window1，
+  「透明」才有东西可露。**这是当前唯一剩下的硬限制**。
+
+下一步两条路（需用户定夺）：① 在模型里建最小 VPP 显示层，正确应答
+`id=0x17` DOV 查询并转发 `PfcDispServer` 回包给 waiter；② 经用户同意，
+把 `libdashclustoractivity.so` 内 1024×600 的 P 档底图**原样**（不重绘、
+不合成、像素不改）喂给 window1 作为过渡。
+
+### 44.4 验收（2026-11-05）
+
+| 项 | 结果 |
+|---|---|
+| `dart analyze lib tool test` | 无问题 |
+| `flutter test`（6 套件） | 66 项全通过 |
+| Dart / Python 帧字节 | 19 帧 `diff` 为空 |
+| 端到端 `--duration 25 --shutdown` | 非黑 **59.45%** / 茶青 **44.76%**，`entered=true`；进场动画 `4.0→47.0→…→59.6%`；关机动画 `10.9→12.1→1.3→0.0%`（`SHUTANIM VISIBLE`）；`RESULT PASS` |
+| Release app | 重新构建，见 `flutter_app/build/macos/Build/Products/Release/ae5i_emu.app` |

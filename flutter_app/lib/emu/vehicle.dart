@@ -56,10 +56,16 @@ extension VehicleStateX on VehicleState {
     _ => false,
   };
 
-  /// 仪表已点亮（车辆已启动）：对应真车「解锁后仪表才点亮」。
-  /// 上电→MCU 启动→（等待解锁）这一整段，仪表保持黑屏待机，不算点亮。
+  /// 面板正在显示内容：对应真车「解锁后仪表才点亮」，且**下电过程中面板
+  /// 仍在亮着**（原厂会先播 logo-out 关机动画，再由 poweroff 把屏变黑）。
+  ///
+  /// 2026-11-05 修复：旧实现漏了 `poweringOff`，一点「停止 / 下电」UI 就
+  /// 立刻切到待机占位，把模型正在倒放的 112 帧 logo 完全盖住 ⇒ 用户看到
+  /// 的「关机动画缺失」其实是客户端遮挡，不是模型没播。
   bool get isAwake => switch (this) {
-    VehicleState.unlocked || VehicleState.ready => true,
+    VehicleState.unlocked ||
+    VehicleState.ready ||
+    VehicleState.poweringOff => true,
     _ => false,
   };
 

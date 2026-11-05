@@ -34,9 +34,10 @@ void _dumpFrames() {
     dashBattFrame(t),
     dashOdoFrame(t),
     dashTripFrame(t),
-    // 固定时间的 RTC 与固定位图的 lamp，便于逐字节比对。
+    // 固定时间的 RTC、固定诊断位图与默认电控状态帧，便于逐字节比对。
     dashPropFrame(DashProp.rtc, [26, 11, 5, 6, 14, 5]),
-    dashLampFrame(DashTelemetry(lampHex: '01'))!,
+    dashLampFrame(DashTelemetry(lampHex: '01')),
+    dashLampFrame(DashTelemetry()), // 电机控制器默认状态（TCS 启用 / P 挡驻车）
   ];
   for (final f in frames) {
     print(_hex(f));
@@ -83,6 +84,7 @@ Future<void> main(List<String> args) async {
   }
   var duration = 60;
   var outPath = '/tmp/dash_up_check.ppm';
+  final shutdown = args.contains('--shutdown');
   for (var i = 0; i < args.length; i++) {
     if (args[i] == '--duration' && i + 1 < args.length) {
       duration = int.tryParse(args[i + 1]) ?? duration;
@@ -242,13 +244,39 @@ Future<void> main(List<String> args) async {
   print('ANIM  ${animSamples.length} samples, nonblack% = '
       '${animSamples.map((v) => (v * 100).toStringAsFixed(1)).join(' ')}');
 
+  // --shutdown：下电前写触发文件，验证模型倒放原厂 logo 这一段确实能在
+  // framebuffer 上看到（app 侧曾用待机占位盖住画面，表现为「关机动画缺失」）。
+  var shutdownOk = true;
+  if (shutdown && spec.shutdownWakeFile != null) {
+    File(spec.shutdownWakeFile!).writeAsStringSync('shutdown\n');
+    print('SHUTDOWN trigger: ${spec.shutdownWakeFile}');
+    final shut = <double>[];
+    for (var i = 0; i < 24; i++) {
+      await Future<void>.delayed(const Duration(milliseconds: 150));
+      shut.add(sample().nonblack);
+    }
+    var hi = 0.0;
+    var lo = 1.0;
+    for (final v in shut) {
+      if (v > hi) hi = v;
+      if (v < lo) lo = v;
+    }
+    // logo-out 期间画面必须和 P 档主界面显著不同，且最后变暗（面板熄灭）。
+    shutdownOk = hi > 0.05 && lo < finalStats.nonblack * 0.5;
+    print('SHUTANIM nonblack% = '
+        '${shut.map((v) => (v * 100).toStringAsFixed(1)).join(' ')}');
+    print('SHUTANIM ${shutdownOk ? 'VISIBLE' : 'NOT VISIBLE'} '
+        'peak=${(hi * 100).toStringAsFixed(2)}% '
+        'min=${(lo * 100).toStringAsFixed(2)}%');
+  }
+
   feeder.stop();
   socket.destroy();
   proc.kill();
   await outSub.cancel();
   await errSub.cancel();
   await qemuLog.close();
-  final ok = peakNonblack >= 0.45 && peakTeal >= 0.30;
+  final ok = peakNonblack >= 0.45 && peakTeal >= 0.30 && shutdownOk;
   print(ok ? 'RESULT PASS' : 'RESULT FAIL');
   exit(ok ? 0 : 1);
 }

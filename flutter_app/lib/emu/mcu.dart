@@ -168,18 +168,20 @@ class McuSim {
 
       case McuKey.gearUp:
       case McuKey.gearDown:
-        // AE5i 无变速箱；拨杆功能和 P/READY/骑行模式不能互相替代。
-        // 0x21709702 的 8/9/10 仅是候选数据，尚无原厂画面差分证明。
+        // 2026-11-05：由 QemuController 写 vehicle_info3.drive_mode
+        // （1=ECO / 2=STREET / 3=SPORT）并经电控状态立即上行。这里仍不注入
+        // 未经验证的 0x21709702 猜测档位；AE5i 无变速箱。
         return McuPressResult([
-          'MCU: ${key == McuKey.gearUp ? '加档' : '减档'}拨杆已按下；'
-              '原生模式映射待验证，不发送猜测档位',
+          'MCU: ${key == McuKey.gearUp ? '加档' : '减档'}拨杆 → '
+              '驾驶模式已随电控状态上报',
         ], stateChanged: false);
 
       case McuKey.custom:
+        // 真车长按 = 功能码 7 切信息组（SetItem4，尚未接入）；仿真里用这个键
+        // 切换 TCS 启用/关闭，状态经 indicator_lamp.TC 上报。
         return McuPressResult([
-          long
-              ? 'MCU: 自定义键长按（真车 = 功能码 7 切信息组，需 SetItem4，未接入）'
-              : 'MCU: 自定义键（切信息组需 SetItem4 功能码 7，未接入）',
+          'MCU: 自定义键${long ? '长按' : '短按'} → TCS 状态已随 '
+              'indicator_lamp 上报',
         ], stateChanged: false);
     }
   }

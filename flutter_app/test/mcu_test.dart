@@ -68,12 +68,12 @@ void main() {
     expect(sim.state.value.cruise, isTrue);
   });
 
-  test('加减拨杆不推断三档，也不触发猜测的 CFCP 属性', () {
+  test('加减拨杆不推断三档，改由电控 drive_mode 上报', () {
     final before = sim.state.value;
     for (final key in [McuKey.gearUp, McuKey.gearDown]) {
       final r = sim.press(key);
       expect(r.stateChanged, isFalse);
-      expect(r.lines.single, contains('不发送猜测档位'));
+      expect(r.lines.single, contains('驾驶模式已随电控状态上报'));
       expect(sim.state.value, same(before));
     }
   });
@@ -84,13 +84,14 @@ void main() {
     expect(r.stateChanged, isFalse);
   });
 
-  test('自定义键长按说明需要 SetItem4 功能码 7（未接入）', () {
+  test('自定义键切换 TCS，状态经 indicator_lamp 上行', () {
     final tap = sim.press(McuKey.custom);
     expect(tap.lines.single, contains('自定义'));
     expect(tap.lines.single, isNot(contains('长按')));
+    expect(tap.lines.single, contains('indicator_lamp'));
     final long = sim.press(McuKey.custom, long: true);
     expect(long.lines.single, contains('长按'));
-    expect(long.lines.single, contains('SetItem4'));
+    expect(long.lines.single, contains('TCS'));
     expect(long.stateChanged, isFalse);
   });
 

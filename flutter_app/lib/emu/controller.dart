@@ -187,6 +187,10 @@ class QemuController {
   /// 开机动画阶段（模型还没把画面交给 guest）。true 时画面上的非黑像素来自
   /// 原厂 logo 动画，不能算"仪表已点亮"。
   final animating = ValueNotifier<bool>(false);
+
+  /// 下电过程中模型正在倒放原厂 logo（logo out）。与 [animating] 分开是为了
+  /// 让 UI 显示正确文案，且在下电阶段继续保持高频抓帧与画面可见。
+  final shutdownAnimating = ValueNotifier<bool>(false);
   bool _animHoldOver = true;
 
   /// 本次（开机/关机）动画的开始时刻。兜底超时按它算而不是按上电时刻——
@@ -211,8 +215,13 @@ class QemuController {
   /// 进场序列已跑完（画面确实由固件点亮），供 displayLit 诚实指示。
   bool _clusterEntered = false;
 
-  /// MCU 遥测数据源：所有上屏数值的唯一真值源，由固件渲染，不重绘。
+  /// 电机控制器 / BMS 遥测数据源：所有上屏数值的唯一真值源，由固件渲染，
+  /// 不重绘。把手按键与整车状态机改写它，再经 CFCP 上行。
   final telemetry = DashTelemetry();
+
+  /// 电控状态版本号：每次 [telemetry] / `telemetry.motor` 变化并上行时自增，
+  /// 用来驱动客户端状态条重建（这些字段本身不是 ValueNotifier）。
+  final motorRevision = ValueNotifier<int>(0);
 
   bool _shutdownRequested = false;
   bool _shutdownCommandSent = false;
@@ -330,6 +339,17 @@ class QemuController {
     if (vehicle.state == VehicleState.unlocked &&
         prev != VehicleState.unlocked) {
       _fireWake();
+    }
+    // READY = 电机控制器动力就绪：EV_READY 置位、解除驻车，立即上行。
+    if (vehicle.state == VehicleState.ready && prev != VehicleState.ready) {
+      telemetry.motor.evReady = 1;
+      telemetry.motor.parking = 0;
+      _syncMotor();
+    } else if (prev == VehicleState.ready &&
+        vehicle.state != VehicleState.ready) {
+      telemetry.motor.evReady = 0;
+      telemetry.motor.parking = 1;
+      _syncMotor();
     }
     return d;
   }
@@ -475,12 +495,40 @@ class QemuController {
     }
     final fn = k.mcu;
     if (fn == null) return null;
+
+    // ★ 电机控制器模拟：加/减档拨杆切驾驶模式，自定义键切 TCS。
+    // 这些状态与车身灯态一起经 vehicle_info3 / indicator_lamp 上行给固件，
+    // 而不是停留在客户端的模型里（2026-11-05 之前正是如此）。
+    switch (fn) {
+      case McuKey.gearUp:
+        telemetry.driveMode =
+            telemetry.driveMode >= 3 ? 1 : telemetry.driveMode + 1;
+        _emit(LogKind.mcu, '电控: 加档 → ${_modeName(telemetry.driveMode)}');
+        _syncMotor();
+        break;
+      case McuKey.gearDown:
+        telemetry.driveMode =
+            telemetry.driveMode <= 1 ? 3 : telemetry.driveMode - 1;
+        _emit(LogKind.mcu, '电控: 减档 → ${_modeName(telemetry.driveMode)}');
+        _syncMotor();
+        break;
+      case McuKey.custom:
+        final m = telemetry.motor;
+        m.tc = m.tc == 1 ? 2 : 1;
+        _emit(LogKind.mcu,
+            '电控: 自定义键${long ? "长按" : "短按"} → TCS ${m.tc == 1 ? "启用" : "关闭"}');
+        _syncMotor();
+        break;
+      default:
+        break;
+    }
+
     final r = mcu.press(fn, long: long);
     for (final line in r.lines) {
       _emit(LogKind.mcu, line);
     }
     mcuEvents.value++;
-    // 车身状态变化时发送实验灯态帧；加减拨杆尚无映射，不注入猜测档位。
+    // 车身状态变化 → 电控状态位（转向 / 远光 / 定速）→ 立即上行。
     if (r.stateChanged) _emitMcuState();
     return r.lines.isEmpty ? null : r.lines.last;
   }
@@ -1160,13 +1208,37 @@ class QemuController {
   /// 会弹故障框卡住 App；要喂必须在进场动画之后只喂一次。
   void _emitMcuState() {
     if (!running.value) return;
-    for (final f in gd32StateFrames(mcu.state.value)) {
+    final s = mcu.state.value;
+    final m = telemetry.motor;
+    // GD32 车身状态 → 电机控制器上行状态位（真车也是汇总后经 CFCP 上报）。
+    m.turnLeft = s.leftLamp ? 1 : 0;
+    m.turnRight = s.rightLamp ? 1 : 0;
+    m.highBeam = s.highBeam ? 1 : 0;
+    m.bigLight = s.highBeam ? 1 : 0;
+    m.cruiseControl = s.cruise ? 1 : 0;
+    // 下行灯态位图帧保留作兼容/日志（集群不消费它，0x21407072 实测 0 px）。
+    for (final f in gd32StateFrames(s)) {
       _cfcpSend(f, log: 'MCU → ${describeFrame(f)}');
     }
+    _syncMotor();
+  }
+
+  static String _modeName(int mode) => switch (mode) {
+    1 => 'ECO',
+    2 => 'STREET',
+    3 => 'SPORT',
+    _ => '模式 $mode',
+  };
+
+  /// 电控状态变化后立刻补一拍上行，不等 0.5 s 心跳周期。
+  void _syncMotor() {
+    final feeder = _dashUp;
+    if (feeder != null) unawaited(feeder.motorChanged());
+    motorRevision.value++;
     _emit(
       LogKind.mcu,
-      'MCU 车身状态：${mcu.state.value.summary} '
-      '（灯态位图=0x${lampMaskFromState(mcu.state.value).toRadixString(16)}）',
+      '电控状态: ${telemetry.motor.summary} · 车速 ${telemetry.speed} km/h · '
+      '${_modeName(telemetry.driveMode)} · 挡位值 ${telemetry.gear}',
     );
   }
 
@@ -1243,7 +1315,11 @@ class QemuController {
       }
     });
     _proc?.stdin.write('\n');
-    _sendShutdownCommand();
+    // 2026-11-05 修复：关机动画不再等 console 提示符。旧实现把它挂在
+    // `_sendShutdownCommand()` 里，而后者要求 `_consoleReady`；一旦串口只
+    // 在启动早期出现过一次 `root@AE5I:/#`（之后被 _serialTail 冲掉），
+    // 下电就走进 25 s 超时分支，模型那边一帧 logo 都不会播。
+    _startShutdownAnimation();
   }
 
   /// 正常下电完成后的「拔电」收尾。
@@ -1265,23 +1341,41 @@ class QemuController {
     _cleanup();
   }
 
+  /// 下电第一步：创建触发文件让模型倒放 112 帧原厂 logo（约 1.87 s），
+  /// 期间保持 `animating` 让客户端高频抓帧、UI 继续显示画面；播完再让
+  /// guest 执行 `poweroff -f`，面板才真正变黑。
+  void _startShutdownAnimation() {
+    if (_shutdownAnimSent) return;
+    _shutdownAnimSent = true;
+    _shutdownCommandSent = true; // 阻止 _emitSerial 里的旧路径重复发 poweroff
+    if (_shutdownWakeFile == null) {
+      _emit(LogKind.app, '未配置关机动画资源，直接进入 poweroff');
+      _reallyPoweroff();
+      return;
+    }
+    shutdownAnimating.value = true;
+    animating.value = true;
+    _animStartedAt = DateTime.now();
+    _animHoldOver = false;
+    try {
+      File(_shutdownWakeFile!).writeAsStringSync('shutdown\n');
+      _emit(LogKind.mcu, 'MCU: 触发关机动画（logo out，原厂 112 帧倒放）');
+      status.value = '关机动画 · 原厂 logo out';
+    } catch (e) {
+      _emit(LogKind.app, '关机动画触发文件写入失败：$e');
+    }
+    Future<void>.delayed(const Duration(milliseconds: 2200), () {
+      if (_disposed) return;
+      shutdownAnimating.value = false;
+      animating.value = false;
+      _reallyPoweroff();
+    });
+  }
+
+  /// 兼容旧调用：console 就绪后直接发 poweroff（不再负责触发动画）。
   void _sendShutdownCommand() {
     if (!_consoleReady || !_shutdownRequested || _shutdownCommandSent) return;
     _shutdownCommandSent = true;
-    // 先触发关机动画（模型倒放 logo），给约 2 秒播放，再真正关机，
-    // 让面板在变黑前能播完 logo-out。
-    if (_shutdownWakeFile != null && !_shutdownAnimSent) {
-      _shutdownAnimSent = true;
-      try {
-        File(_shutdownWakeFile!).writeAsStringSync('shutdown\n');
-        _emit(LogKind.mcu, 'MCU: 触发关机动画（logo out）');
-      } catch (_) {}
-      Future.delayed(const Duration(milliseconds: 2200), () {
-        if (_disposed) return;
-        _reallyPoweroff();
-      });
-      return;
-    }
     _reallyPoweroff();
   }
 
@@ -1332,6 +1426,7 @@ class QemuController {
     _wakeFired = false;
     _shutdownWakeFile = null;
     _shutdownAnimSent = false;
+    shutdownAnimating.value = false;
     // 注意：不重置整车状态。正常关机后应停在 poweredOff，等用户「拔电」；
     // 异常退出则停在 unsafeCut，保留告警。
     _timer?.cancel();
@@ -1362,6 +1457,8 @@ class QemuController {
     _proc?.kill();
     _mon?.destroy();
     _cfcp?.destroy();
+    shutdownAnimating.dispose();
+    motorRevision.dispose();
     clusterState.dispose();
     mcu.dispose();
   }
