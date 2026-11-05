@@ -3843,12 +3843,6 @@ App，恒 0。
 
 ### 44.3 顶部方形黑条：透明处露出的是空的 PFC 背景层（未闭环）
 
-> ★ **2026-11-05 晚更正（见 §45）**：本节把 `PFC_DOV : get dov failed`
-> 当作「背景层闸门」是**错的** —— 反汇编 `libspdovcfg.so` 证实那是
-> `getBTMAC()` 读蓝牙 MAC 拼 WiFi 名，与显示层无关；背景 `.yuv` 资源在这套
-> 原厂镜像里也根本不存在。顶部黑条的真实成因、像素证据与最终修复见
-> **§45**，此处仅保留当时的取证过程供追溯。
-
 用户定性为渲染问题：「对应 icon 的位置不是黑色，而是透明的」。取证：
 
 | 证据 | 结果 |
@@ -3887,128 +3881,53 @@ App，恒 0。
 
 ---
 
-## 45. 顶部黑条：纠正 DOV 误判，实现 PFC 显示控制器背景色平面（2026-11-05 晚）
+## 45. PFC 背景色平面尝试失败 —— 已完整回滚（2026-11-05 晚）
 
-用户要求「按路径 1，原生地、彻底解决顶部黑条，并确保渲染稳定」。本轮先把
-§42.6 / §44.3 的归因**推翻重做**，再在 QEMU 模型里补齐真实显示层语义。
-**全程没有重绘、没有按实车照合成、没有引入任何外部位图**。
+18:38 提交 `f16b6da` 试图用「PFC 显示控制器背景色平面」消除顶部黑条：
+window1 为空时，用 guest 自己 OSD 暗色像素的均值填一层平坦底色。
+**用户实测判定失败**：黑条没消掉，且整幅背景对比度失真（茶青墙与左侧
+深绿底被压暗、中部出现更黑的矩形分界）。已 `git revert` 完整回滚，
+模型源码与二进制回到 `d1c08eb` 状态，`--duration 20 --shutdown` 复验
+非黑 **59.46%** / 茶青 **44.76%**、`RESULT PASS`，与 §44.4 基线一致。
 
-### 45.1 ★ 纠正：`PFC_DOV : get dov failed` 与背景层无关
+### 45.1 ★ 更正：本轮「DOV 与背景层无关」的归因是错的
 
-从 `images/ae5i.spvd` 的 `spsdk` 分区（squashfs @0x1181000）解出
-`libspdovcfg.so`，反汇编 `dov_send_cmd`（0x6a8）：
+`f16b6da` 曾断言 `PFC_DOV : get dov failed` 只是 `getBTMAC()` 拼 WiFi 名
+（`ZEEHO-b5aa15`）时的良性日志，与显示层无关。**该结论片面，作废**：
+`libspdovcfg.so` 内部导出的调用者确实只有 `getBTMAC` / `getSwingLevel` /
+`getUniqueKey`，但外部（`PfcDispServer` 侧）还会用
+**`subcmd=0x54e1`** 调 `dov_send_cmd()` 查询 **DOV 图层配置**，这才是
+`PfcDispServer` 拿到 `get_bg_info Background W/H: 1024/600` 之后卡住的那一步。
 
-```c
-IPC_FunctionCall(0x17, msg, 14);      // 返回值非 0 → 打日志
-if (*(u16*)(msg+0xc)) log("get dov failed");
-for (i=0; i<len; i++) out[i] = msg[2+i];
+用户确认的链路与判据（恢复 §42.6 / `run_ui.sh` 注释的原始结论）：
+
+```
+PfcDispServer 在跑 → get_bg_info 1024/600 成功
+  → IPC id=0x17, len=14, subcmd=0x54e1 查 DOV 图层配置
+  → dov_send_cmd() 收包后读 msg+0xc，非 0 判失败
+  → "PFC_DoV : get dov failed" ⇒ 图层配置不生效 ⇒ 背景层空
 ```
 
-调用者只有 `getBTMAC()`（子命令 `0x102`）、`getSwingLevel()`（`0x101`）、
-`getUniqueKey()`。串口里那行日志正好出现在
-`getPlatformMacName` → `Wifi local name: "ZEEHO-b5aa15"` 旁边，进程
-`PfcDispServer`(647) 的线程 672。**它读的是蓝牙 MAC，不是 DOV 图层配置**。
-§42.6 把它当成「背景层闸门」是错的，所以上一轮无论怎么改 DOV 应答，
-画面都零变化。
+模型当前**只能伪造回包**（`reply[3]=0; reply[4]=0`），让状态字看起来成功，
+但 daemon 从未参与、图层参数仍是空的。真正需要的是
+**「转发请求 → 等 daemon 回包 → 按 dword2 bit15 送回原 waiter」** 的双向事务。
 
-顺带把 `libspdovcfg.so` / `libpfc_service.so` / `pfc_server` 从
-`spsdk` 分区解出（`/tmp/ae5i_spsdk_root`），后续可继续逆向。
+### 45.2 已验证的路由约束（不要再试全局切换）
 
-### 45.2 真正的背景链路，以及它为什么在仿真里是 dormant
-
-`libpfc_service.so` 里的事实：
-
-| 符号 | 行为 |
+| 实验 | 结果 |
 |---|---|
-| `BackGroundFlipThread::threadLoop` (0x104fc) | `fcntl64(fd, F_GETLK/F_SETLKW)` 与 `sp_fb` 同步，再 `system("echo \"%d sw\" > /sys/module/sp_fb/parameters/mon")` 翻页 |
-| `PlatformControl::draw_background_from_nand` (0x10800) | `system("dd if=/tmp/sp/application/etc/background/%d.yuv of=/dev/fb%d ibs=.. obs=.. count=1 seek=..")` |
+| `SP_IPC_MODE=1`（只回用户态） | `get dov failed` 次数 **3 → 1**，说明有一个 DOV 请求确实被 daemon 接走处理了 |
+| 同上 | 但 `id=3`（`fbdss` 取 UI 分辨率）是**内核侧 `IPC_FunctionCall` 等待者**，只回用户态 → 永不唤醒 → 串口刷 `RPC SERVER #7 NOT RUNNING!`，整个显示栈停摆、CFCP 停发 |
+| `SP_IPC_MODE=2`（内核回包 + 延迟用户态副本） | 显示栈能起来，但 DOV 仍是伪造应答，背景层不通 |
 
-用 `tools/guest_shell.py` 在 guest 内部核查：
+⇒ 正解必须**按 id 分流**：`id=3/2/6/9` 保持内核等待者（bit15=1）；
+`id=0x17` 单独做「转发给 daemon → 收回包 → 按 bit15 送回 waiter」事务，
+并带超时兜底，避免 daemon 不回时卡死。**不能**用全局 `SP_IPC_MODE` 一刀切。
 
-```
-/dev/fb*                                  → 只有 /dev/fb0 (29,0)，没有 fb1
-/tmp/sp/application/etc/background/      → No such file or directory
-find / -name "*.yuv"                      → 无
-/sys/module/sp_fb/parameters/mon         → 存在
-```
+### 45.3 当前状态
 
-再 `pmemsave` 导出 256 MB RAM 全扫：**除 fb0 两页外没有任何图像数据**，
-`res_fb1`(0x0C600000) / `res_fb2`(0x0CC00000) 两页都是 0.00%（连 alpha 全 0）。
-即：背景位图资源在这套原厂镜像里根本不存在，`draw_background_from_nand`
-即使被调也会 `dd` 失败。**「让固件自己 dd 一张 .yuv」这条路物理上走不通**，
-不是模型少应答了某个 IPC。
-
-### 45.3 顶部黑条的像素级成因
-
-`monitor xp` / `pmemsave` 精确采样 OSD（fb0）：
-
-```
-y=  0..10 : 00 00 00 ff   全部 128/128   ← 不透明纯黑
-y= 20..30 : 00 00 00 00   全部 128/128   ← alpha=0，真透明
-y= 50..120: 00 00 00 ff 为主，夹杂 01 03 01 ff / 04 08 04 ff / 02 04 02 ff
-```
-
-**仪表底色是 `02 04 02` 这类极深灰，而状态栏那块被清成 `00 00 00`
-纯黑**，加上 `SP_FB_COMPOSITE` 把「RGB 全 0」当色键透明、回落到全空的
-window1 ⇒ 一条边界笔直、比周围更黑的方条。这与用户的定性完全一致：
-「icon 位置应该是透明的，而不是黑色方块」。
-
-### 45.4 实现：PFC 显示控制器的 background colour plane
-
-真实 PFC 在没有加载背景位图时，仍会驱动一层**平坦背景色**在 OSD 之下。
-模型此前把「window1 为空」直接当成全 0（纯黑），等于把这层丢掉了。
-新增 `sp_pfc_background_color()` + `sp_fb_dump()` compositor 分支：
-
-* 颜色**只从 guest 自己这一帧 OSD 已经画出的暗色像素采样求均值**
-  （`r,g,b <= 40` 且非色键 0），典型结果 `0xff121308`（深青灰）。
-  不读实车照、不读 .so 素材、不产生任何新图案。
-* 仅当 `SP_FB_COMPOSITE` 且 window1 采样全空时才接管；**一旦固件真的
-  往 window1 贴了背景位图，该层自动让位**（`bg_any` 判断）。
-* **条件启用**：采样点中非黑像素 ≥5%（P 档主界面约 64%，待机统计页
-  4.37%）才生效；`anim_running` / `shutdown_running` 期间禁用，保证开机
-  / 关机 logo 仍是黑底。这样可以维持进场动画采样和 `dash_up.py`
-  「画面掉回待机页 → 重放上电序列」的自愈保险丝。
-* 开关：`SP_PFC_BG_AUTO=0` 关闭（A/B 回退），
-  `SP_PFC_BG_COLOR=0x00RRGGBB` 固定颜色，`SP_PFC_TRACE` 打印采样值。
-
-### 45.5 同时修掉的两处 IPC 真实 bug
-
-* `sp_ipc_user_fifo_ready()` 的 fifo 偏移原来是猜的 `+0x578/+0x57c`。
-  反汇编 AE5I `rpc_isr` (0xc0418b14)：`add r2, chan, #0x156 / #0x16a`
-  → `ldr r0,[dev, r2, lsl #2]`，即 **+0x558 / +0x5a8**。旧值一次都匹配
-  不上（每次启动 77 条 `IPC deliver: no userspace fifo, dropped`）。
-  已按内核实测值修正，150Aura 的 `+0x55c/+0x5ac` 保留为 fallback。
-* `id=0x17` 的应答曾把 `dword4`（`IPC_FunctionCall` 埋的 seq）清成 0，
-  与内核 `rpc_check_seq()` 契约冲突。现默认原样 echo，
-  `SP_IPC_DOV_MODE=0` 可回退做 A/B。注意此修复只影响 `getBTMAC` 的
-  启动日志，**与画面无关**（§45.1）。
-
-### 45.6 构建环境的坑（改名残留）
-
-`tools/build_model.py` 报 `Neither directory '.../qemu-lab/qemu-src' ...`：
-`build/build.ninja` 与 `meson-private/coredata.dat` 里还存着改名前的
-源码路径，触发 meson `--internal regenerate` 后必失败。修法：
-pickle 修 `coredata.dat` 的 `config_files`、文本替换 `build.ninja` /
-`cmd_line.txt` 里的旧路径，并**删除 `build build.ninja: REGENERATE_BUILD`
-规则块**（只改 `.c` 源文件，构建规则本身有效，不需要重新生成）。
-备份在 `/tmp/zeeho-trash/meson-pathfix/`。
-
-### 45.7 验收（数值只作回归基线，观感由用户判断）
-
-| 项 | 修复前 | 修复后 |
-|---|---|---|
-| 待机统计页非黑 | 4.37% | 3.98%（背景色平面未启用） |
-| P 档主界面非黑 | 59.5% | 94.58%（透明区由背景色填平） |
-| 茶青占比 | 44.8% | 44.77%（**未变**，主界面元素没被动过） |
-| 进场动画采样 | 4.0→…→59.6% | 4.0→91.0→…→94.6% |
-| 关机动画 | 10.9→12.1→0.0% | 99.9→…→0.0%（动画期间禁用背景色后复核） |
-| `RESULT PASS` | ✅ | ✅ |
-| `dart analyze` / 66 项测试 | ✅ | ✅ |
-
-`nonblack` 变成 ~95% 是背景色平面填充的必然结果（每个透明像素现在都有
-底色），不是画面元素变化 —— 茶青占比恒定 44.77% 可以佐证主界面本体没动。
-`dash_up.py` 的自愈判据 `nonblack >= 15` 在待机页仍会掉到 ~4%，保险丝有效。
-
-**已知限制**：原厂镜像不含背景 `.yuv`，guest 也没有 `/dev/fb1`，所以
-window1 仍是一张永不启用的层。本节实现的是 PFC 控制器的背景**色**平面，
-不是背景位图层。若将来补齐原厂壁纸资源，模型会自动改用 window1 的真实内容。
+渲染已回滚到 §44 验收版；顶部黑条与 PFC/DOV 背景层**仍未解决**，
+按路径 1 继续（见 §42.6、§44.3、`run_ui.sh` 注释）。
+本轮 `libspdovcfg.so` / `libpfc_service.so` / `pfc_server` 已从 SPVD 的
+`spsdk` 分区（squashfs @0x1181000）解出至 `/tmp/ae5i_spsdk_root`，
+供后续反汇编 `subcmd=0x54e1` 的调用点使用。

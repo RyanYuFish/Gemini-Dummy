@@ -18,13 +18,9 @@ export SP_FB_FRAME=/tmp/ui-frame.ppm
 #   ★ 别改成 1（只回用户态）：id=3（fbdss 取 UI 分辨率）用的是内核侧
 #   IPC_FunctionCall 等待者，只回用户态会让它永远等不到 → 整个显示栈停摆
 #   （串口刷 "RPC SERVER #7 NOT RUNNING!"），CFCP 也不再发帧。
-#   ★ 2026-11-05 更正：id=23(0x17) 其实是 libspdovcfg 的
-#   getBTMAC / getSwingLevel（拼 WiFi 名 "ZEEHO-xxxx"），与显示层无关；
-#   "PFC_DOV : get dov failed" 只是良性的启动日志。见 EMULATION.md §45.1。
-# 顶部状态栏原来那条纯黑方条 = window1 背景层空、OSD 色键透明处露出全 0。
-# 模型现实现 PFC 显示控制器的「背景色平面」：颜色取自 guest 自己 OSD 里
-# 已画出的暗色像素，只在主界面启用，开机/关机 logo 期间禁用。
-# SP_PFC_BG_AUTO=0 可关闭做 A/B，SP_PFC_BG_COLOR=0xRRGGBB 可固定。见 §45。
+#   id=23(0x17)=DOV 查询属于用户态↔用户态，要真正答对必须把请求转发给
+#   PfcDispServer 再把它的回包送回等待者 —— 模型目前只能伪造回包，所以
+#   "PFC_DOV : get dov failed" 仍有 3 次（开机早期）。见 EMULATION.md §42.6。
 export SP_PFC_TRACE=1 SP_IPC_MODE=2
 export SP_VDISK=$SPVD SP_VDISK_BASE=0x50000000
 exec "$QEMU" -M sunplus-sp8368 -m 256 -kernel "$KERNEL" -append "$APPEND" \
