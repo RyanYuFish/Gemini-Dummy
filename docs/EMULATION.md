@@ -4349,9 +4349,30 @@ MCU 下发 auto-shutdown 后才开始的 10 步，提前计时会在用户还在
 
 真实 QEMU 探针通过：12V 待机、错误密码保持锁定、正确密码解锁并播放 logo、刷卡关机后再次刷卡唤醒、模拟 TBOX 蓝牙钥匙后 Ready 唤醒、再次进入密码页并长按 BACK 触发原生 `shutdown_notify`（`bit5`）及关机、最后拔除 12V。相关状态机、密码、CFCP、MCU 和按键回归共 59 项通过。蓝牙钥匙连接与 NFC 是客户端模拟事件，并非已完成真实无线协议或 NFC 设备仿真。
 
-### 50.2 尚未闭环
+### 50.2 倒计时自动关机：已修复并真 QEMU 验收（2026-11-06）
 
-- 固件倒计时触发 `shutdown_notify` 的端到端路径仍未验收；当前不声称倒计时已修复。
+实车行为：密码页长时间空闲 → 仪表自动关机。最初按 §49.5 静态逆向，以为 MCU 发
+`MCU_SIGNAL_AUTOMATIC_SHUTDOWN`（`0x21709606` payload[0]=0x01）后固件会跑原生 10×1s 倒计时、归零
+发 bit5。真 QEMU 探针（`test/native_password_countdown.dart`）实测推翻该假设：客户端发信号后，
+固件**既不起原生倒计时、也不回 bit5**（串口无 PasswordUL 倒计时、无 `bits=0x20`），密码页永远停在待机态。
+
+因此修正实现：自动关机改由 **MCU 仿真器自己驱动**，走与长按 BACK / 密码等待超时同一条
+`_shutdownFromPassword` 路径（`flutter_app/lib/emu/dash_up.dart`）：
+
+- `_startAutoShutdownTimer()`：密码页开启后、`passwordAutoShutdownDelay`（默认 20s）宽限期一到，
+  若仍未解锁（`!_stopped && !_passwordShutdown && !_passwordCancelled && password.active`）
+  直接 `_shutdownFromPassword('密码页空闲超时')` → 控制器正常下电。
+- `passwordKey()` / `passwordFromFirmware()` 每次按键 / 固件提交都重置该定时器，所以用户正在输密码时
+  不会误关机；只有完全空闲超时才关机。
+- `dashAutoShutdownFrame()`（`MCU_SIGNAL_AUTOMATIC_SHUTDOWN` 帧）保留为合法帧编码，供兼容固件 / Python
+  工具使用，但本构建不再依赖它（固件不响应）。
+- 已接进 `passwordBegin()` 与 `_awaitPassword()`；`_cancelPasswordTimers()` 一并回收该定时器。
+
+真 QEMU 验收（2026-11-06）：`flutter_app/test/native_password_countdown.dart` 上电 → 长按 Ready 进
+密码页 → 不输密码，31 秒后仪表自动下电（`running=false` / `vehicle.state=poweredOff`），串口含
+`密码页空闲超时` 日志。客户端纯逻辑 `test/password_test.dart` 17 项全过（含空闲关机 / 解锁不关机 /
+持续按键不误关机）；`dart analyze lib/emu` 无问题。**倒计时自动关机端到端已修复并验收**。
+
 - 72V 是解锁行为的目标语义，尚无独立高压电源硬件模型或对应实车协议验证。升降档与 READY 为客户端 MCU 状态模拟和上报，不等于电控真实执行；长按 BACK 倒挡、油门行驶及其原厂报文仍需实现和验证。
 - 开机动画帧重放、PFC 合成、真实蓝牙/Wi-Fi、RS-485 和原厂 OTA 引导/刷写/恢复仍有未完成项；不能以密码路径通过证明全功能仪表仿真完成。
 

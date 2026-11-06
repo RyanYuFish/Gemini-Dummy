@@ -3,6 +3,8 @@
 // 界面由 guest 里的 Qt 类 PasswordUL / PasswordULFB70 绘制；本文件验证的是
 // **MCU 侧**的 4 位密码会话、6 B `Power_On_Passwd` 属性帧，以及客户端
 // 状态机不再保存任何可用于绘制密码界面的数据。
+import 'dart:typed_data';
+
 import 'package:ae5i_emu/emu/cfcp.dart';
 import 'package:ae5i_emu/emu/dash_up.dart';
 import 'package:ae5i_emu/emu/password.dart';
@@ -173,6 +175,84 @@ void main() {
           reason: '客户端按键只能透传，不能自己判密码');
       expect(m.dispatch(VehicleEvent.passwordVerified).accepted, isTrue);
       expect(m.state, VehicleState.unlocked);
+    });
+  });
+
+  group('MCU 自动关机信号帧 (MCU_SIGNAL_AUTOMATIC_SHUTDOWN)', () {
+    test('dashAutoShutdownFrame 只置 payload[0]=0x01，不置解锁 bit', () {
+      final parsed = cfcpParseProp(dashAutoShutdownFrame());
+      expect(parsed, isNotNull);
+      expect(parsed!.prop, DashProp.sync);
+      expect(parsed.sub, 0);
+      expect(parsed.value, [0x01, 0, 0, 0, 0, 0, 0, 0]);
+    });
+
+    test('与解锁帧互斥：dashSyncFrame(true) 只置 byte[1] bit2', () {
+      final unlock = cfcpParseProp(dashSyncFrame(true))!;
+      final auto = cfcpParseProp(dashAutoShutdownFrame())!;
+      expect(unlock.value[1] & 0x04, 0x04); // 解锁通知
+      expect(auto.value[1] & 0x04, 0); // 自动关机帧不带解锁
+      expect(auto.value[0], 0x01); // 自动关机位
+    });
+  });
+
+  group('密码页空闲自动关机（固件不响应 AUTOMATIC_SHUTDOWN，MCU 自己计时）', () {
+    DashUpFeeder _feeder(List<Uint8List> sent,
+        {Duration delay = const Duration(milliseconds: 30),
+        void Function()? onShutdown}) {
+      return DashUpFeeder(
+        send: (f) async => sent.add(f),
+        paintedPct: () => 0.0,
+        animating: () => false,
+        onLog: (_) {},
+        onPhase: (_, __) {},
+        onPasswordShutdown: onShutdown,
+        requirePassword: true,
+        passwordAutoShutdownDelay: delay,
+        passwordTimeout: const Duration(seconds: 5),
+        preArmTimeout: const Duration(seconds: 5),
+      );
+    }
+
+    test('宽限期满仍未解锁 → 触发 onPasswordShutdown（自动关机）', () async {
+      var shutdown = false;
+      final sent = <Uint8List>[];
+      final f = _feeder(sent, onShutdown: () => shutdown = true);
+      await f.passwordBegin();
+      await Future.delayed(const Duration(milliseconds: 150));
+      expect(shutdown, isTrue, reason: '宽限期满应自动关机');
+    });
+
+    test('宽限期内解锁 → 不触发自动关机', () async {
+      var shutdown = false;
+      final sent = <Uint8List>[];
+      // 宽限期必须大于 passwordBegin 自身的 120ms 睡眠，否则定时器会在解锁前
+      // 于 passwordBegin 内部就触发（那是测试时序假象，不是逻辑缺陷）。
+      final f = _feeder(sent,
+          delay: const Duration(milliseconds: 300),
+          onShutdown: () => shutdown = true);
+      await f.passwordBegin();
+      // 模拟固件提交正确密码（默认 0000）→ 客户端校验通过 → 取消定时器
+      await f.passwordFromFirmware(_submit('0000'));
+      await Future.delayed(const Duration(milliseconds: 250));
+      expect(shutdown, isFalse, reason: '已解锁不应再触发自动关机');
+    });
+
+    test('用户持续按键 → 每次活动重置宽限期，不误关机', () async {
+      var shutdown = false;
+      final sent = <Uint8List>[];
+      // 宽限期必须大于 passwordBegin 自身的 120ms 睡眠，否则定时器会在 begin
+      // 内部睡眠期间就触发（测试时序假象，不是逻辑缺陷）。
+      final f = _feeder(sent,
+          delay: const Duration(milliseconds: 300),
+          onShutdown: () => shutdown = true);
+      await f.passwordBegin();
+      // 反复按 上（模拟用户正在选数字）：每次都应重置空闲倒计时
+      for (var i = 0; i < 5; i++) {
+        await f.passwordKey(PasswordKey.up);
+        await Future.delayed(const Duration(milliseconds: 60));
+      }
+      expect(shutdown, isFalse, reason: '持续输入不应触发自动关机');
     });
   });
 }

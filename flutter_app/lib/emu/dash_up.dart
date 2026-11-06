@@ -348,6 +348,28 @@ Uint8List dashSyncFrame(bool unlock) {
   return dashPropFrame(DashProp.sync, b);
 }
 
+/// MCU → 仪表「自动关机」信号帧（`MCU_SIGNAL_AUTOMATIC_SHUTDOWN`）。
+///
+/// 据 `mcucom_rx_synchronization_status` 的映射（EMULATION.md §49.5）：
+/// `0x21709606` 的 **`payload[0]` 整字节 → `sysState.byte[0]`** 即 AUTOMATIC_SHUTDOWN
+/// 信号位。`payload[0]` 置非 0（这里用 0x01）应触发仪表
+/// `PasswordUL::slot_restartTimeout()` 跑原生倒计时，归零 → `shutDown()` →
+/// `Power_On_Passwd byte[4]|=0x20`（bit5）回 MCU。
+///
+/// **本 AE5I 固件实测不响应此信号**（见 §50.2 真 QEMU 探针：客户端发信号后
+/// 固件既不起原生倒计时、也不回 bit5）。因此自动关机改由 MCU 仿真器自己驱动
+/// （见 [_startAutoShutdownTimer]），走与长按 BACK / 密码等待超时同一条
+/// [_shutdownFromPassword] 路径。本帧保留为合法帧编码，供兼容固件 / Python 工具使用。
+///
+/// 本帧**只置 `payload[0]`、byte[1]=0**（不带解锁通知 bit2）：只发自动关机，不解锁。
+const int pwAutoShutdownSignal = 0x01;
+
+Uint8List dashAutoShutdownFrame() {
+  final b = _buf(8);
+  b[0] = pwAutoShutdownSignal;
+  return dashPropFrame(DashProp.sync, b);
+}
+
 /// Power_On_Passwd (6 B)：[0..3] 4 位密码（ASCII 数字） [4] 状态位 [5] 保留。
 ///
 /// 固件 `PasswordULFB70::VertifyPasswd(QString)` 只认长度 4；
@@ -491,6 +513,7 @@ class DashUpFeeder {
     this.onPasswordShutdown,
     this.requirePassword = false,
     this.passwordTimeout = const Duration(seconds: 120),
+    this.passwordAutoShutdownDelay = const Duration(seconds: 20),
     this.preArmTimeout = const Duration(seconds: 25),
   })  : telemetry = telemetry ?? DashTelemetry(),
         password = password ?? McuPassword();
@@ -539,6 +562,14 @@ class DashUpFeeder {
   /// 等待用户在固件原生密码页上输入的时间上限。
   final Duration passwordTimeout;
 
+  /// 密码页开启后、MCU 发自动关机信号前的宽限期。
+  ///
+  /// 宽限期内不触发关机，给用户足够时间输密码；宽限期过后若仍未解锁，MCU
+  /// 发 `MCU_SIGNAL_AUTOMATIC_SHUTDOWN`（`dashAutoShutdownFrame`）让固件跑原生
+  /// 倒计时（已更正流程：倒计时由固件负责，MCU 只发触发信号 + 收 bit5）。
+  /// 值太小会在用户还在输密码时误关机；太大则倒计时迟迟不出现。
+  final Duration passwordAutoShutdownDelay;
+
   final Duration preArmTimeout;
 
   static bool _false() => false;
@@ -564,6 +595,10 @@ class DashUpFeeder {
   bool _passwordCancelled = false;
 
   Timer? _backLongTimer;
+
+  /// 密码页宽限期定时器：到点未解锁则发 `MCU_SIGNAL_AUTOMATIC_SHUTDOWN`
+  /// 让固件跑原生倒计时（归零发 bit5 → 客户端下电）。
+  Timer? _autoShutdownTimer;
 
   /// 固件 `KeyDelegate::app_key_press_left()` 的长按判定是 3000 ms；
   /// 多留 200 ms 余量。即使固件没把 shutdown_notify 透传出来，长按 BACK
@@ -620,6 +655,7 @@ class DashUpFeeder {
     _passwordShutdown = false;
     _passwordCancelled = false;
     if (!password.active) password.begin();
+    _startAutoShutdownTimer();
     onLog('DashUp: MCU 开启开机密码会话 → 0x21709701 bit6 请求固件原生 PasswordUL');
     await _send(dashPowerPasswdFrame());
     await _sleep(const Duration(milliseconds: 120));
@@ -649,6 +685,7 @@ class DashUpFeeder {
   /// 把手按键（客户端已同时把同一 KeyID 原样透传给仪表）。
   Future<void> passwordKey(PasswordKey k) async {
     if (_stopped || _passwordShutdown) return;
+    _startAutoShutdownTimer(); // 每次按键重置空闲倒计时，避免输密码时被误关机
     await _passwordResult(password.key(k));
   }
 
@@ -693,15 +730,40 @@ class DashUpFeeder {
     onPasswordShutdown?.call();
   }
 
+  /// 密码会话开始后的「空闲自动关机」倒计时（MCU 仿真器自己驱动）。
+  ///
+  /// 真 QEMU 探针（EMULATION.md §50.2）证明：本 AE5I 固件**不响应**
+  /// `MCU_SIGNAL_AUTOMATIC_SHUTDOWN`——客户端发信号后，固件既不起原生倒计时、
+  /// 也不回 bit5，密码页会永远停在待机态。所以自动关机改由 MCU 仿真器负责，
+  /// 与长按 BACK / 密码等待超时走同一条 [_shutdownFromPassword] 路径，
+  /// 保证「密码页长时间空闲 → 仪表自动关机」这一实车行为可复现。
+  ///
+  /// 每次按键 / 固件提交都会重置该定时器（见 [passwordKey] / [passwordFromFirmware]），
+  /// 因此用户正在输密码时不会误关机；只有完全空闲超过 [passwordAutoShutdownDelay]
+  /// 才关机。已解锁 / 已下电 / 会话被取消则什么都不做。
+  void _startAutoShutdownTimer() {
+    if (_passwordShutdown || _passwordCancelled) return;
+    _autoShutdownTimer?.cancel();
+    _autoShutdownTimer = Timer(passwordAutoShutdownDelay, () {
+      if (_stopped || _passwordShutdown || _passwordCancelled) return;
+      if (!password.active) return;
+      onLog('DashUp: 密码页空闲超时 → MCU 自动关机（固件不响应 AUTOMATIC_SHUTDOWN 信号）');
+      _shutdownFromPassword('密码页空闲超时');
+    });
+  }
+
   void _cancelPasswordTimers() {
     _backLongTimer?.cancel();
     _backLongTimer = null;
+    _autoShutdownTimer?.cancel();
+    _autoShutdownTimer = null;
   }
 
   /// 固件 `PasswordUL` 通过 `mcucom_tx_power_on_passwd` 直接提交密码时，
   /// 由控制器解析 `0x21709701` 上行帧后交给 MCU 校验。
   Future<void> passwordFromFirmware(List<int> payload) async {
     if (_stopped || _passwordShutdown) return;
+    _startAutoShutdownTimer(); // 固件提交一次输入也算活动，重置空闲倒计时
     final r = password.verifyFrame(payload);
     if (r == PasswordResult.pending) return;
     onLog('DashUp: 收到固件 PasswordUL 密码结果 / 校验请求');
@@ -832,6 +894,7 @@ class DashUpFeeder {
         '已上报「本次上电需要密码」→ 固件显示原生密码解锁页，等待输入 4 位密码');
     if (!password.active) password.begin();
     _passwordShutdown = false;
+    _startAutoShutdownTimer();
     final deadline = DateTime.now().add(passwordTimeout);
     while (!_stopped &&
         !_passwordShutdown &&
