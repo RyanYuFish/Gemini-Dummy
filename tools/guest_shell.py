@@ -55,7 +55,7 @@ if ipc_stub not in ("", "0", "false", "off", "no"):
 else:
     env.pop("SP_IPC_STUB", None)
 
-log = open("/tmp/shr.log", "wb")
+log = open(os.environ.get("SP_SHR_LOG", "/tmp/shr.log"), "wb")
 err = open("/tmp/shr.err", "wb")
 serial_args = ["-chardev", f"socket,host=127.0.0.1,port={PORT},server=on,wait=off,id=c0",
                "-serial", "chardev:c0"]

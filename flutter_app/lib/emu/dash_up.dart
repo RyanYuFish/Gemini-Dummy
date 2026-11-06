@@ -350,18 +350,19 @@ Uint8List dashSyncFrame(bool unlock) {
 
 /// MCU → 仪表「自动关机」信号帧（`MCU_SIGNAL_AUTOMATIC_SHUTDOWN`）。
 ///
-/// 据 `mcucom_rx_synchronization_status` 的映射（EMULATION.md §49.5）：
-/// `0x21709606` 的 **`payload[0]` 整字节 → `sysState.byte[0]`** 即 AUTOMATIC_SHUTDOWN
-/// 信号位。`payload[0]` 置非 0（这里用 0x01）应触发仪表
-/// `PasswordUL::slot_restartTimeout()` 跑原生倒计时，归零 → `shutDown()` →
-/// `Power_On_Passwd byte[4]|=0x20`（bit5）回 MCU。
+/// 据 §49.5（AE4i）的 `mcucom_rx_synchronization_status` 映射，`0x21709606` 的
+/// `payload[0]` 整字节对应 AUTOMATIC_SHUTDOWN。但 **§50.2 真 QEMU 实测本 AE5I
+/// 固件不响应此信号**：客户端发帧后，固件既不起倒计时也不回 bit5。
 ///
-/// **本 AE5I 固件实测不响应此信号**（见 §50.2 真 QEMU 探针：客户端发信号后
-/// 固件既不起原生倒计时、也不回 bit5）。因此自动关机改由 MCU 仿真器自己驱动
-/// （见 [_startAutoShutdownTimer]），走与长按 BACK / 密码等待超时同一条
-/// [_shutdownFromPassword] 路径。本帧保留为合法帧编码，供兼容固件 / Python 工具使用。
+/// 进一步符号级逆向（2026-11-06）查明原因：AE5I `PasswordUL` **自己在构造函数里
+/// 就启动了 20s 定时器**，20s 后自动进入右上角 10s 倒计时（显示 10S…1S），归零
+/// 时发 `Power_On_Passwd bit5`（shutdown_notify）——根本不需要 MCU 触发。
 ///
-/// 本帧**只置 `payload[0]`、byte[1]=0**（不带解锁通知 bit2）：只发自动关机，不解锁。
+/// 因此本帧在当前构建**不发送**，仅保留为合法帧编码，供兼容其它固件 / Python
+/// 工具使用。真正的兜底下电见 [_startAutoShutdownTimer]（默认 35s，晚于固件
+/// 20s+10s 序列，避免在倒计时刚显示时抢先下电）。
+///
+/// 本帧只置 `payload[0]`、byte[1]=0（不带解锁通知 bit2）：只发自动关机，不解锁。
 const int pwAutoShutdownSignal = 0x01;
 
 Uint8List dashAutoShutdownFrame() {
@@ -513,7 +514,7 @@ class DashUpFeeder {
     this.onPasswordShutdown,
     this.requirePassword = false,
     this.passwordTimeout = const Duration(seconds: 120),
-    this.passwordAutoShutdownDelay = const Duration(seconds: 20),
+    this.passwordAutoShutdownDelay = const Duration(seconds: 35),
     this.preArmTimeout = const Duration(seconds: 25),
   })  : telemetry = telemetry ?? DashTelemetry(),
         password = password ?? McuPassword();
@@ -562,12 +563,14 @@ class DashUpFeeder {
   /// 等待用户在固件原生密码页上输入的时间上限。
   final Duration passwordTimeout;
 
-  /// 密码页开启后、MCU 发自动关机信号前的宽限期。
+  /// 密码页空闲的 **MCU 兜底下电**宽限期（正常情况用不到）。
   ///
-  /// 宽限期内不触发关机，给用户足够时间输密码；宽限期过后若仍未解锁，MCU
-  /// 发 `MCU_SIGNAL_AUTOMATIC_SHUTDOWN`（`dashAutoShutdownFrame`）让固件跑原生
-  /// 倒计时（已更正流程：倒计时由固件负责，MCU 只发触发信号 + 收 bit5）。
-  /// 值太小会在用户还在输密码时误关机；太大则倒计时迟迟不出现。
+  /// ★ 固件 `PasswordUL` 自己就有完整原生倒计时（真 QEMU 已证）：
+  /// 构造时启动 20s 定时器 → 20s 后 `slot_restartTimeout` 置显示标志并启动
+  /// 1s 定时器 → `slot_downCountTimeout` 递减 10→0（右上角显示 10S…1S）→
+  /// 归零固件发 `Power_On_Passwd` bit5（shutdown_notify）→ 客户端正常下电。
+  /// 因此本值必须 **大于固件 20s+10s 序列**（默认 35s），否则 MCU 会在倒计时
+  /// 刚要显示时抢先下电，导致「右上角倒计时不出现」。正常永远轮不到这个兜底。
   final Duration passwordAutoShutdownDelay;
 
   final Duration preArmTimeout;
@@ -732,11 +735,13 @@ class DashUpFeeder {
 
   /// 密码会话开始后的「空闲自动关机」倒计时（MCU 仿真器自己驱动）。
   ///
-  /// 真 QEMU 探针（EMULATION.md §50.2）证明：本 AE5I 固件**不响应**
-  /// `MCU_SIGNAL_AUTOMATIC_SHUTDOWN`——客户端发信号后，固件既不起原生倒计时、
-  /// 也不回 bit5，密码页会永远停在待机态。所以自动关机改由 MCU 仿真器负责，
-  /// 与长按 BACK / 密码等待超时走同一条 [_shutdownFromPassword] 路径，
-  /// 保证「密码页长时间空闲 → 仪表自动关机」这一实车行为可复现。
+  /// MCU 兜底：只在固件原生倒计时整条链路失效时才收尾。
+  ///
+  /// ★ 真 QEMU 已证（EMULATION.md §50.2）：正常流程由固件自己完成——
+  /// `PasswordUL` 构造时启动 20s 定时器 → 20s 后右上角显示 10S…1S →
+  /// 归零发 `Power_On_Passwd` bit5（shutdown_notify）→ 客户端正常下电。
+  /// 因此本兜底**不能早于固件 30s 序列**（默认 35s），否则会在倒计时刚
+  /// 显示时抢先下电（2026-11-06 用户实测「右上角倒计时不出现」的真因）。
   ///
   /// 每次按键 / 固件提交都会重置该定时器（见 [passwordKey] / [passwordFromFirmware]），
   /// 因此用户正在输密码时不会误关机；只有完全空闲超过 [passwordAutoShutdownDelay]
@@ -747,7 +752,7 @@ class DashUpFeeder {
     _autoShutdownTimer = Timer(passwordAutoShutdownDelay, () {
       if (_stopped || _passwordShutdown || _passwordCancelled) return;
       if (!password.active) return;
-      onLog('DashUp: 密码页空闲超时 → MCU 自动关机（固件不响应 AUTOMATIC_SHUTDOWN 信号）');
+      onLog('DashUp: 密码页空闲超时 → MCU 兜底下电（固件原生倒计时未接管）');
       _shutdownFromPassword('密码页空闲超时');
     });
   }

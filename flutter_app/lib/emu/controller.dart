@@ -117,6 +117,25 @@ class LogLine {
 // ---------------------------------------------------------------- controller
 
 class QemuController {
+  QemuController({this.passwordAutoShutdownDelay = const Duration(seconds: 35)});
+
+  /// 密码页空闲兜底下电宽限期（仅在固件原生序列失效时才动手）。
+  ///
+  /// ★ 真 QEMU 已证（`test/native_password_countdown_visible.dart`）：固件
+  /// `PasswordUL` **自己就有完整的原生倒计时**，不依赖 MCU 信号：
+  ///   构造时 `QTimer#1->start(20000)`
+  ///   → 20s 后 `slot_restartTimeout()`：停 #1、`QTimer#2->start(1000)`、置
+  ///     `[this+0x1ec]=1`
+  ///   → 每 1s `slot_downCountTimeout()` 递减 `[this+0x1f0]` 10→0 并重绘
+  ///   → `paintEvent` 仅在 `[this+0x1ec]!=0` 时画 `QString::number([0x1f0])`
+  ///   → 归零后固件发 `Power_On_Passwd` **bit5（0x20）= shutdown_notify**
+  /// 实测右上角依次显示 10S/6S/1S，~30s 时 bit5 到达 → 客户端正常下电。
+  ///
+  /// 因此本值必须 **大于固件 20s+10s 序列**（默认 35s），否则 MCU 会在倒计时
+  /// 刚要显示时抢先下电，导致「右上角倒计时不出现」（2026-11-06 实车复现的
+  /// 就是这个）。正常情况永远轮不到这个兜底。
+  final Duration passwordAutoShutdownDelay;
+
   Process? _proc;
   Socket? _mon;
   Socket? _cfcp;
@@ -1361,6 +1380,7 @@ class QemuController {
       telemetry: telemetry,
       password: mcuPassword,
       requirePassword: needsPassword,
+      passwordAutoShutdownDelay: passwordAutoShutdownDelay,
       onPasswordVerified: (accepted) {
         if (accepted) {
           _dispatch(VehicleEvent.passwordVerified);

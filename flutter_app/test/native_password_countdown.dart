@@ -1,17 +1,16 @@
-// Real-QEMU acceptance probe for the password-page auto-shutdown countdown.
+// Real-QEMU acceptance probe for the password-page idle auto-shutdown.
 //
-// Verifies §50.2 end-to-end against live firmware:
-//   password page opens (requirePassword) → no password is typed
-//   → after the idle grace window the MCU emulator drives the auto-shutdown
-//     (same path as long-press BACK / password timeout) → instrument powers off.
-// This build's firmware does NOT honor MUCI_SIGNAL_AUTOMATIC_SHUTDOWN, so the
-// MCU must run the countdown itself; this probe proves the idle page actually
-// shuts the cluster down without any user input.
+// Corrected flow (verified 2026-11-06): the firmware PasswordUL owns the whole
+// sequence — 20s idle → 10s top-right countdown (10S..1S) → bit5
+// (shutdown_notify) on Power_On_Passwd → controller normal power-off.
+// The MCU grace (default 35s) is ONLY a fallback and must not fire first.
+//
+// This probe types no password and proves the idle page shuts the cluster down
+// via the firmware's bit5, not via the MCU fallback.
 import 'dart:async';
 import 'dart:io';
 import 'dart:ui' as ui;
 import 'package:ae5i_emu/emu/controller.dart';
-import 'package:ae5i_emu/emu/password.dart';
 import 'package:ae5i_emu/emu/vehicle.dart';
 import 'package:flutter_test/flutter_test.dart';
 
@@ -51,15 +50,19 @@ void main() {
       await snap('01-password-page');
       expect(c.mcuPassword.active, true, reason: 'password session must be active');
 
-      // Do NOT type the password. The MCU emulator must auto-shut-down the
-      // idle page after its grace window (default 20s) via _shutdownFromPassword.
+      // Do NOT type the password. Firmware PasswordUL runs its own
+      // 20s idle + 10s countdown and then emits bit5 (shutdown_notify);
+      // the MCU grace (35s) is only a fallback and must not fire first.
       final mark = lines.length;
       await snap('02-idle-waiting');
+      await until(() => lines.skip(mark).any((l) => l.contains('bits=0x20')), seconds: 45);
+      expect(lines.skip(mark).any((l) => l.contains('固件 shutdown_notify')), true,
+          reason: 'countdown end must arrive as firmware shutdown_notify (bit5)');
+      expect(lines.skip(mark).any((l) => l.contains('密码页空闲超时')), false,
+          reason: 'MCU fallback must not preempt the firmware countdown');
       await until(() => !c.running.value, seconds: 45);
       expect(c.vehicle.state, VehicleState.poweredOff,
-          reason: 'idle password page must auto-shut-down after grace window');
-      expect(lines.skip(mark).any((l) => l.contains('密码页空闲超时')), true,
-          reason: 'MCU must drive the idle auto-shutdown itself (firmware ignores signal)');
+          reason: 'idle password page must shut down after the firmware countdown');
       await Future<void>.delayed(const Duration(seconds: 1));
       await snap('03-shutdown');
     } finally {

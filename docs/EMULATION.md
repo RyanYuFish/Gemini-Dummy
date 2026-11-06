@@ -4349,29 +4349,54 @@ MCU 下发 auto-shutdown 后才开始的 10 步，提前计时会在用户还在
 
 真实 QEMU 探针通过：12V 待机、错误密码保持锁定、正确密码解锁并播放 logo、刷卡关机后再次刷卡唤醒、模拟 TBOX 蓝牙钥匙后 Ready 唤醒、再次进入密码页并长按 BACK 触发原生 `shutdown_notify`（`bit5`）及关机、最后拔除 12V。相关状态机、密码、CFCP、MCU 和按键回归共 59 项通过。蓝牙钥匙连接与 NFC 是客户端模拟事件，并非已完成真实无线协议或 NFC 设备仿真。
 
-### 50.2 倒计时自动关机：已修复并真 QEMU 验收（2026-11-06）
+### 50.2 倒计时自动关机：固件原生倒计时（已修复并真 QEMU 视觉验收，2026-11-06）
 
-实车行为：密码页长时间空闲 → 仪表自动关机。最初按 §49.5 静态逆向，以为 MCU 发
-`MCU_SIGNAL_AUTOMATIC_SHUTDOWN`（`0x21709606` payload[0]=0x01）后固件会跑原生 10×1s 倒计时、归零
-发 bit5。真 QEMU 探针（`test/native_password_countdown.dart`）实测推翻该假设：客户端发信号后，
-固件**既不起原生倒计时、也不回 bit5**（串口无 PasswordUL 倒计时、无 `bits=0x20`），密码页永远停在待机态。
+实车行为：密码页长时间空闲 → 右上角出现 10s 倒计时 → 归零后仪表自动关机。
 
-因此修正实现：自动关机改由 **MCU 仿真器自己驱动**，走与长按 BACK / 密码等待超时同一条
-`_shutdownFromPassword` 路径（`flutter_app/lib/emu/dash_up.dart`）：
+**此前两次误判**：
 
-- `_startAutoShutdownTimer()`：密码页开启后、`passwordAutoShutdownDelay`（默认 20s）宽限期一到，
-  若仍未解锁（`!_stopped && !_passwordShutdown && !_passwordCancelled && password.active`）
-  直接 `_shutdownFromPassword('密码页空闲超时')` → 控制器正常下电。
-- `passwordKey()` / `passwordFromFirmware()` 每次按键 / 固件提交都重置该定时器，所以用户正在输密码时
-  不会误关机；只有完全空闲超时才关机。
-- `dashAutoShutdownFrame()`（`MCU_SIGNAL_AUTOMATIC_SHUTDOWN` 帧）保留为合法帧编码，供兼容固件 / Python
-  工具使用，但本构建不再依赖它（固件不响应）。
-- 已接进 `passwordBegin()` 与 `_awaitPassword()`；`_cancelPasswordTimers()` 一并回收该定时器。
+1. 最初按 §49.5（AE4i 逆向）以为 MCU 发 `MCU_SIGNAL_AUTOMATIC_SHUTDOWN`（`0x21709606` payload[0]=0x01）
+   后固件会跑原生 10×1s 倒计时、归零发 bit5。真 QEMU 实测：客户端发该信号后固件毫无反应。
+2. 于是改为 MCU 在 20s 宽限期满时直接 `_shutdownFromPassword('密码页空闲超时')`。功能上能关机，但用户
+   实测**右上角倒计时不出现**——最终根因正是：那 20s 恰好是固件自己倒计时开始的时刻，MCU 抢先下电把
+   倒计时掐掉了。
 
-真 QEMU 验收（2026-11-06）：`flutter_app/test/native_password_countdown.dart` 上电 → 长按 Ready 进
-密码页 → 不输密码，31 秒后仪表自动下电（`running=false` / `vehicle.state=poweredOff`），串口含
-`密码页空闲超时` 日志。客户端纯逻辑 `test/password_test.dart` 17 项全过（含空闲关机 / 解锁不关机 /
-持续按键不误关机）；`dart analyze lib/emu` 无问题。**倒计时自动关机端到端已修复并验收**。
+**真实机制（AE5I `libdashclustoractivity.so` 静态逆向 + 真 QEMU 抓帧，已闭环）**：
+`PasswordUL` 自己就有完整原生倒计时，**不依赖任何 MCU 自动关机信号**：
+
+| 环节 | 证据（地址为 Thumb 符号；该段 `.text` 的 sh_addr==sh_offset） |
+|---|---|
+| 构造时启动 20s 定时器 | `PasswordUL::PasswordUL` @0xab1d1：`QTimer#1->start(0x4e20=20000)`；两个 QTimer 存在 `this+0x1e4/0x1e8` |
+| 20s 到 → 进入倒计时 | `slot_restartTimeout` @0xa8e25：停 #1、`QTimer#2->start(1000)`、`this+0x1ec=1` |
+| 每 1s 递减 | `slot_downCountTimeout` @0xaa475：`this+0x1f0--`（10→0），>0 重绘，=0 停表并收尾 |
+| 画右上角数字 | `paintEvent` @0xab9a1：`ldrb r3,[r5,#0x1ec]; cmp #0; beq skip`，非 0 才 `QString::number([0x1f0],10)` 并绘制 |
+| 归零 → 关机 | 固件发 `Power_On_Passwd byte[4] |= 0x20`（wire **bit5** = shutdown_notify）→ `McuPassword.verifyFrame` 判 shutdown → 控制器正常下电 |
+| 重置入口 | `resetTimerShutDown` @0xa99f9：停 #2、#1->start(20000)、`[0x1ec]=0`、`[0x1f0]=10` |
+
+`test/native_password_countdown_visible.dart` 真 QEMU（MCU 宽限期临时设 120s，确保不干扰）实测：密码页
+出现后 21s 帧右上角 **10S**、25s 帧 **6S**、29s 帧 **1S/4S**（不同轮次相位略有差异）；30s 前后串口出现
+`CFCP ← 原生密码状态 6B bits=0x20` → `密码页要求关机（固件 shutdown_notify）` → 正常下电。
+
+**最终修复**：MCU 不再抢关机，只做兜底。
+
+- `QemuController.passwordAutoShutdownDelay` 默认 **35s**（> 固件 20s+10s），仅在固件原生序列失效时才
+  `_shutdownFromPassword('密码页空闲超时')`；正常情况永远轮不到它。
+- 固件 `bits=0x20` 到达即由 `onPasswordShutdown` 走正常下电（与长按 BACK 同一路径）。
+- `dashAutoShutdownFrame()` 保留为合法帧编码，但本构建不再发送 / 依赖（固件不响应）。
+
+真 QEMU 验收（2026-11-06）：
+
+- `test/native_password_countdown_visible.dart`：21/25/29s 抓帧断言「画面必须变化」，串口含 `bits=0x20`
+  与 `固件 shutdown_notify`，最终 `running=false`。**通过**（36s）。
+- `test/native_password_countdown.dart`：默认 35s 兜底，空闲密码页仍由固件 bit5 先关机，且断言**不出现**
+  `密码页空闲超时`（证明 MCU 兜底未抢先）。**通过**（38s）。
+- `test/password_test.dart` 等纯逻辑回归 41 项全过；`dart analyze lib/emu` 无问题。
+
+取证说明：AE5I spapp 分区的 squashfs id/fragment/inode 表均损坏，`unsquashfs` 无法直接解包；但 QEMU
+guest 内核能正常挂载并运行该分区。因此通过 `tools/guest_pull.py`（分块 base64 + 每块 md5 校验重传）从
+guest 的 `/tmp/sp/application/lib/activity/default/libdashclustoractivity.so`（27,482,056 B）按需拉取
+`.dynsym/.dynstr` 与相关函数代码段做符号级反汇编。截图与串口日志见 `dist/password-countdown-visible/`
+（含 21s/25s/29s 帧）。
 
 - 72V 是解锁行为的目标语义，尚无独立高压电源硬件模型或对应实车协议验证。升降档与 READY 为客户端 MCU 状态模拟和上报，不等于电控真实执行；长按 BACK 倒挡、油门行驶及其原厂报文仍需实现和验证。
 - 开机动画帧重放、PFC 合成、真实蓝牙/Wi-Fi、RS-485 和原厂 OTA 引导/刷写/恢复仍有未完成项；不能以密码路径通过证明全功能仪表仿真完成。
