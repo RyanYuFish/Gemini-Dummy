@@ -21,6 +21,7 @@ import 'emu/gd32.dart';
 import 'emu/keys.dart';
 import 'emu/machine.dart';
 import 'emu/mcu.dart';
+import 'emu/password.dart';
 import 'emu/paths.dart';
 import 'emu/spvd.dart';
 import 'emu/vehicle.dart';
@@ -372,12 +373,12 @@ class _EmuPageState extends State<EmuPage> with SingleTickerProviderStateMixin {
               children: [
                 FilledButton.tonal(
                   onPressed: v || starting ? null : _startSequence,
-                  child: const Text('上电'),
+                  child: const Text('12V 上电'),
                 ),
                 const SizedBox(width: 8),
                 OutlinedButton(
                   onPressed: v ? () => c.requestPowerOff('客户端停止') : null,
-                  child: const Text('停止 / 下电'),
+                  child: const Text('仪表关机 / 锁定'),
                 ),
               ],
             ),
@@ -423,15 +424,16 @@ class _EmuPageState extends State<EmuPage> with SingleTickerProviderStateMixin {
     }
   }
 
-  /// 长按 Ready：蓝牙已连 TBOX 直接解锁；无连接则进入仪表原生密码输入界面
-  /// （上/下/SET/BACK 驱动，见密码盘 HUD）。此处不再弹客户端密码框。
+  /// 长按 Ready：蓝牙已连 TBOX 直接解锁；无连接则请求仪表显示固件原生
+  /// `PasswordUL` 密码界面。客户端不画任何密码界面，也不弹密码框。
   Future<void> _readyLongPress() async {
     if (starting) return;
     setState(() => starting = true);
     try {
       final d = await c.longPressReady(spvdPath: selectedSpvd);
       if (!mounted) return;
-      // promptPassword = 已进入仪表密码输入界面，由密码盘 HUD 接管，无需 toast。
+      // promptPassword = 已请求固件原生密码界面，画面区直接显示 framebuffer，
+      // 不需要也不允许任何客户端提示覆盖它。
       if (!d.accepted &&
           d.effect != VehicleEffect.promptPassword &&
           d.effect != VehicleEffect.confirmUnsafeCut) {
@@ -508,54 +510,6 @@ class _EmuPageState extends State<EmuPage> with SingleTickerProviderStateMixin {
     );
   }
 
-  Future<void> _editPin() async {
-    final edit = TextEditingController(text: c.vehicle.pin);
-    final pin = await showDialog<String>(
-      context: context,
-      builder: (ctx) => AlertDialog(
-        title: const Text('仿真解锁密码'),
-        content: Column(
-          mainAxisSize: MainAxisSize.min,
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            const Text(
-              '手机 App 里设置的密码（仿真默认 000000，仅演示仪表原生密码界面）。'
-              '无连接时长按 Ready 后，用上/下选数字、SET 确认、BACK 删改输完它即可解锁；'
-              '上/下/SET/BACK 会实时转发给仪表，但不校验固件。',
-              style: TextStyle(fontSize: 12),
-            ),
-            const SizedBox(height: 12),
-            TextField(
-              controller: edit,
-              autofocus: true,
-              maxLength: 6,
-              decoration: const InputDecoration(
-                labelText: '密码',
-                counterText: '',
-              ),
-              onSubmitted: (v) => Navigator.pop(ctx, v.trim()),
-            ),
-          ],
-        ),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.pop(ctx),
-            child: const Text('取消'),
-          ),
-          FilledButton(
-            onPressed: () => Navigator.pop(ctx, edit.text.trim()),
-            child: const Text('保存'),
-          ),
-        ],
-      ),
-    );
-    // 对话框退场动画期间 TextField 可能仍引用 controller，延迟释放更安全。
-    Future<void>.delayed(const Duration(milliseconds: 600), edit.dispose);
-    if (pin == null || pin.isEmpty) return;
-    c.setSimPin(pin);
-    _toast('仿真密码已更新（仅客户端演示）');
-  }
-
   Widget _stateBadge(VehicleState s) {
     final color = _stateColor(s);
     return Container(
@@ -589,7 +543,7 @@ class _EmuPageState extends State<EmuPage> with SingleTickerProviderStateMixin {
 
   /// 主流程条：断电 › 上电 › 未解锁 › 已解锁 › READY › 关机 › 拔电
   Widget _flowStrip(VehicleState state) {
-    const labels = ['断电', '上电', '未解锁', '已解锁', 'READY', '关机', '拔电'];
+    const labels = ['12V 断电', '通电待机', '仪表启动/密码', '解锁 P', '前进 READY', '关机锁定', '异常断电'];
     final active = state.flowIndex;
     final spans = <TextSpan>[];
     for (var i = 0; i < labels.length; i++) {
@@ -665,7 +619,7 @@ class _EmuPageState extends State<EmuPage> with SingleTickerProviderStateMixin {
       builder: (_, _) {
         final state = c.vehicleState.value;
         final canUnlock =
-            state == VehicleState.off ||
+            state == VehicleState.poweredOff ||
             state == VehicleState.booting ||
             state == VehicleState.locked;
         return Container(
@@ -693,7 +647,7 @@ class _EmuPageState extends State<EmuPage> with SingleTickerProviderStateMixin {
                 crossAxisAlignment: WrapCrossAlignment.center,
                 children: [
                   _action(
-                    '上电',
+                    '12V 上电',
                     !starting &&
                         (state == VehicleState.off ||
                             state == VehicleState.unsafeCut),
@@ -701,7 +655,7 @@ class _EmuPageState extends State<EmuPage> with SingleTickerProviderStateMixin {
                   ),
                   _action(
                     '刷 NFC 卡',
-                    !starting && state != VehicleState.poweredOff,
+                    !starting && state.isPowered,
                     () =>
                         _runVehicle(() => c.swipeCard(spvdPath: selectedSpvd)),
                   ),
@@ -714,21 +668,15 @@ class _EmuPageState extends State<EmuPage> with SingleTickerProviderStateMixin {
                   _action(
                     'Ready 长按',
                     !starting &&
-                        (state == VehicleState.locked ||
+                        (state == VehicleState.poweredOff ||
+                            state == VehicleState.locked ||
                             state == VehicleState.unlocked ||
                             state == VehicleState.ready),
                     _readyLongPress,
                   ),
-                  _action(state.isPowered ? '强制拔电' : '拔电', !starting, _unplug),
-                  _connChip('蓝牙→TBOX', c.bleConnected, c.setBleConnected),
+                  _action('12V 下电', !starting, _unplug),
+                  _connChip('TBOX 蓝牙钥匙 cfmoto-xxxx', c.bleConnected, c.setBleConnected),
                   _connChip('TBOX 在线', c.tboxOnline, c.setTboxOnline),
-                  IconButton(
-                    tooltip: '仿真解锁密码',
-                    iconSize: 15,
-                    visualDensity: VisualDensity.compact,
-                    onPressed: _editPin,
-                    icon: const Icon(Icons.password),
-                  ),
                 ],
               ),
               const SizedBox(height: 4),
@@ -772,26 +720,34 @@ class _EmuPageState extends State<EmuPage> with SingleTickerProviderStateMixin {
               ),
               clipBehavior: Clip.antiAlias,
               child: ListenableBuilder(
-                listenable: c.vehicleState,
+                listenable: Listenable.merge([c.vehicleState, c.pwNotifier, c.authTransitionBlank]),
                 builder: (_, _) {
+                  if (c.authTransitionBlank.value) {
+                    return const ColoredBox(color: Colors.black);
+                  }
                   final state = c.vehicleState.value;
-                  final awake = state.isAwake;
+                  final passwordUi = c.vehicle.passwordMode;
+                  // ★ 密码会话期间画面区**只显示 framebuffer**：固件原生
+                  //   PasswordUL 由 guest 自己绘制。客户端不叠徽标、不画密码盘、
+                  //   不弹提示横幅，也不让待机占位盖住仪表画面。
+                  final awake = state.isAwake || passwordUi;
                   return Stack(
                     fit: StackFit.expand,
                     children: [
                       // 真车：仪表只在「解锁（车辆启动）」后才点亮。上电→MCU 启动→
-                      // 等待解锁这段，仪表保持黑屏待机，不显示 framebuffer。
+                      // 等待解锁这段保持黑屏待机；但进入原生密码界面必须直显
+                      // framebuffer，否则固件自己画的界面会被占位遮住。
                       if (awake)
                         (frame == null || !c.running.value
                             ? _bootSplash()
                             : RawImage(image: frame, fit: BoxFit.contain))
                       else
                         _clusterStandby(state),
-                      // 客户端仿真层 HUD：固件不知道解锁状态，这里只显示状态机
-                      Positioned(left: 8, top: 8, child: _stateBadge(state)),
-                      if (c.vehicle.passwordMode) _passwordPad(),
+                      // 客户端仿真层 HUD（密码会话期间完全隐藏，不抢固件画面）
+                      if (!passwordUi)
+                        Positioned(left: 8, top: 8, child: _stateBadge(state)),
                       // 画面点亮后的诚实提示横幅（黑屏期 / 局部页面都在预期内）。
-                      if (awake)
+                      if (!passwordUi && awake)
                         ListenableBuilder(
                           listenable: Listenable.merge([
                             c.displayLit,
@@ -800,9 +756,6 @@ class _EmuPageState extends State<EmuPage> with SingleTickerProviderStateMixin {
                             c.shutdownAnimating,
                           ]),
                           builder: (_, _) {
-                            if (c.vehicle.passwordMode) {
-                              return const SizedBox.shrink();
-                            }
                             // 下电时面板仍在亮着：先播原厂 logo-out，别用
                             // 「开机动画」文案，也别让待机占位盖住画面。
                             if (c.shutdownAnimating.value) {
@@ -901,83 +854,8 @@ class _EmuPageState extends State<EmuPage> with SingleTickerProviderStateMixin {
     );
   }
 
-  /// 仪表原生密码输入界面的客户端镜像：上/下选数字、SET 确认、BACK 删改。
-  /// 用户输入的同时，上/下/SET/BACK 已实时转发给仪表（见 controller.pwUp 等）。
-  Widget _passwordPad() {
-    return Positioned(
-      left: 0,
-      right: 0,
-      bottom: 8,
-      child: Center(
-        child: ListenableBuilder(
-          listenable: c.pwNotifier,
-          builder: (_, _) {
-            final v = c.vehicle;
-            final slots = List<String>.generate(v.pin.length, (i) {
-              if (i < v.pwEntered.length) return v.pwEntered[i].toString();
-              if (i == v.pwEntered.length) return v.pwCursor.toString();
-              return '–';
-            });
-            return Column(
-              mainAxisSize: MainAxisSize.min,
-              children: [
-                Container(
-                  padding: const EdgeInsets.symmetric(
-                    horizontal: 12,
-                    vertical: 5,
-                  ),
-                  decoration: BoxDecoration(
-                    color: const Color(0xCC101417),
-                    borderRadius: BorderRadius.circular(20),
-                    border: Border.all(color: const Color(0x66FFB454)),
-                  ),
-                  child: const Text(
-                    '仪表密码输入 · 上/下选数字 · SET 确认 · BACK 删改',
-                    style: TextStyle(fontSize: 10.5, color: Color(0xFFFFC978)),
-                  ),
-                ),
-                const SizedBox(height: 8),
-                Row(
-                  mainAxisSize: MainAxisSize.min,
-                  children: [
-                    for (var i = 0; i < slots.length; i++)
-                      Container(
-                        width: 34,
-                        height: 42,
-                        margin: const EdgeInsets.symmetric(horizontal: 4),
-                        alignment: Alignment.center,
-                        decoration: BoxDecoration(
-                          color: i == v.pwEntered.length
-                              ? const Color(0x332AD4B0)
-                              : const Color(0x22000000),
-                          border: Border.all(
-                            color: i == v.pwEntered.length
-                                ? const Color(0xFF3DDC97)
-                                : const Color(0xFF3A444E),
-                            width: i == v.pwEntered.length ? 2 : 1,
-                          ),
-                          borderRadius: BorderRadius.circular(6),
-                        ),
-                        child: Text(
-                          slots[i],
-                          style: TextStyle(
-                            fontSize: i == v.pwEntered.length ? 22 : 18,
-                            fontWeight: FontWeight.w600,
-                            color: i == v.pwEntered.length
-                                ? const Color(0xFF9CFFE0)
-                                : const Color(0xFFE9EEF2),
-                          ),
-                        ),
-                      ),
-                  ],
-                ),
-              ],
-            );
-          },
-        ),
-      ),
-    );
-  }
+  // 密码解锁没有客户端界面：4 位输入由固件 `PasswordUL` 自己绘制，
+  // 校验与会话状态在 MCU 仿真器（emu/password.dart），画面区只直显 framebuffer。
 
   /// 仪表待机（黑屏）占位：对应真车「上电 → MCU 启动 → 等待解锁」整段，
   /// 仪表保持断电黑屏，只有解锁（车辆启动）后才点亮。
@@ -1455,7 +1333,8 @@ class _EmuPageState extends State<EmuPage> with SingleTickerProviderStateMixin {
                   _mcuChip('左转 ◀', s.leftLamp, const Color(0xFFFFC978)),
                   _mcuChip('右转 ▶', s.rightLamp, const Color(0xFFFFC978)),
                   _mcuChip('双闪', s.hazard, const Color(0xFFFFC978)),
-                  _mcuChip('远光', s.highBeam, const Color(0xFF7FB2FF)),
+                  _mcuChip('照明', s.highBeam, const Color(0xFF7FB2FF)),
+                  _mcuChip('超车灯', s.passOn, const Color(0xFF7FB2FF)),
                   _mcuChip('定速', s.cruise, const Color(0xFF3DDC97)),
                   const SizedBox(width: 6),
                   _infoChip('TCS ${m.tc == 1 ? 'ON' : 'OFF'}'),
@@ -1530,12 +1409,23 @@ class _EmuPageState extends State<EmuPage> with SingleTickerProviderStateMixin {
   Widget _keyButton(InstrumentKey k) {
     final down = pressedKey == k.label;
     final supported = k.supported;
-    // 仪表密码输入界面下，上/下/SET/BACK 驱动密码盘（并转发给仪表）。
-    final pwLabels = const {'上', '下', 'SET', 'BACK'};
-    final isPwKey = c.vehicle.passwordMode && pwLabels.contains(k.label);
+    // 固件原生密码界面下，上/下/SET/BACK 原样透传给仪表，同时喂给 MCU 校验；
+    // 客户端不绘制任何密码盘。
+    final pwLabels = const {
+      '上': PasswordKey.up,
+      '下': PasswordKey.down,
+      'SET': PasswordKey.set,
+      'BACK': PasswordKey.back,
+    };
+    final pwKey = c.vehicle.passwordMode ? pwLabels[k.label] : null;
     // 自定义键有独立的**长按**语义（真车 = 长按功能码 7 切信息组），
     // 所以它的短按动作放到抬起时才发，避免按住时短按+长按各触发一次。
-    final isCustom = k.mcu == McuKey.custom;
+    final isReady = k.label == '启动';
+    final isCustom = k.mcu == McuKey.custom ||
+        k.mcu == McuKey.highBeam ||
+        isReady;
+    final isPass = k.mcu == McuKey.pass;
+    var longHandled = false;
 
     void fire({bool long = false}) {
       c.pressInstrumentKey(k, long: long).then((hint) {
@@ -1545,32 +1435,38 @@ class _EmuPageState extends State<EmuPage> with SingleTickerProviderStateMixin {
 
     void pressDown() {
       setState(() => pressedKey = k.label);
-      if (isPwKey) {
-        switch (k.label) {
-          case '上':
-            c.pwUp();
-            break;
-          case '下':
-            c.pwDown();
-            break;
-          case 'SET':
-            c.pwSet();
-            break;
-          case 'BACK':
-            c.pwBack();
-            break;
-        }
+      if (pwKey != null) {
+        // ★ 真实按下，不合成 40 ms tap：固件 `KeyDelegate` 靠按住时长
+        //   判定长按（BACK 3000 ms → clickLongBack → 关机）。合成 tap
+        //   永远触发不了长按，这正是「长按 BACK 关机不生效」的根因。
+        c.pwKeyDown(pwKey);
       } else if (!isCustom) {
         // 仪表键 → CFCP KeyID 帧；MCU 键 → 车身模型。两者都由控制器分流。
-        fire();
+        if (isPass) {
+          c.mcuKeyDown(k);
+        } else {
+          fire();
+        }
       }
     }
 
-    /// `fireShort` = false 时不触发动作（滑动取消 / 长按已触发）。
+    /// `fireShort` = false 时不触发短按（滑动取消 / 长按已触发）。
     void pressUp({bool fireShort = true}) {
       setState(() => pressedKey = null);
-      if (isPwKey || !isCustom || !fireShort) return;
-      fire();
+      if (pwKey != null) {
+        c.pwKeyUp(pwKey);
+        return;
+      }
+      if (isPass) {
+        c.mcuKeyUp(k);
+        return;
+      }
+      if (!isCustom || !fireShort) return;
+      if (isReady) {
+        _runVehicle(c.pressReady);
+      } else {
+        fire();
+      }
     }
 
     void longPress() {
@@ -1578,6 +1474,7 @@ class _EmuPageState extends State<EmuPage> with SingleTickerProviderStateMixin {
       if (k.label == '启动') {
         _readyLongPress();
       } else if (isCustom) {
+        longHandled = true;
         fire(long: true);
       }
     }
@@ -1593,11 +1490,13 @@ class _EmuPageState extends State<EmuPage> with SingleTickerProviderStateMixin {
       ),
       child: InkWell(
         borderRadius: BorderRadius.circular(7),
-        onTapDown: supported ? (_) => pressDown() : null,
-        onTapUp: supported ? (_) => pressUp() : null,
-        onTapCancel: supported ? () => pressUp(fireShort: false) : null,
+        onTapDown: (supported || isReady) ? (_) => pressDown() : null,
+        onTapUp: (supported || isReady)
+            ? (_) => pressUp(fireShort: !longHandled)
+            : null,
+        onTapCancel: (supported || isReady) ? () => pressUp(fireShort: false) : null,
         onLongPress: k.hasLongPress ? longPress : null,
-        onTap: supported
+        onTap: (supported || isReady)
             ? () {}
             : () {
                 final message = k.label == '启动'
@@ -1627,7 +1526,7 @@ class _EmuPageState extends State<EmuPage> with SingleTickerProviderStateMixin {
               ),
               const SizedBox(height: 1),
               Text(
-                k.label == '启动' ? '长按 Ready' : k.badge,
+                k.label == '启动' ? '短按前进 / 长按开关机' : k.badge,
                 style: TextStyle(
                   fontFamily: 'monospace',
                   fontSize: 7.5,

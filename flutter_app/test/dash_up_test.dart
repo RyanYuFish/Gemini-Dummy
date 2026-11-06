@@ -131,6 +131,24 @@ void main() {
     expect(dashKeepFrames(t).any((f) => _prop(f) == DashProp.lampIn), isTrue);
   });
 
+  test('挡位边沿单独上报 vehicle_info2，常规电控更新不重复上报', () async {
+    final sent = <Uint8List>[];
+    final t = DashTelemetry();
+    final feeder = DashUpFeeder(
+      send: (frame) async => sent.add(frame),
+      paintedPct: () => 1,
+      telemetry: t,
+    );
+    feeder.entered = true;
+    t.gear = 0;
+    await feeder.gearChanged();
+    expect(sent.where((f) => _prop(f) == DashProp.vi2).single[26], 0);
+    sent.clear();
+    await feeder.motorChanged();
+    expect(sent.any((f) => _prop(f) == DashProp.vi2), isFalse);
+    feeder.stop();
+  });
+
   test('三段式进场：pre-arm 不喂解锁 / settle 20 拍 gear=0 / enter 只一次 gear=1',
       () async {
     final sent = <Uint8List>[];
@@ -140,6 +158,8 @@ void main() {
       send: (f) async => sent.add(f),
       paintedPct: () => 0.5, // 首帧已出，pre-arm 立即收尾
       preArmTimeout: const Duration(seconds: 1),
+      // 本用例验证「不需要密码」的三段式进场红线，不进入原生密码会话。
+      requirePassword: false,
       onPhase: (p, _) {
         if (p == DashUpPhase.boot) bootAt ??= sent.length;
         if (p == DashUpPhase.hold) feeder.stop();

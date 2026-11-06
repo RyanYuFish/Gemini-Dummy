@@ -18,14 +18,15 @@ import 'package:flutter/foundation.dart';
 
 /// 真车把手上不经过仪表的按键（GD32 直接执行）。
 enum McuKey {
-  pass, // 超车灯：瞬时闪远光
+  pass, // 超车灯：按住闪灯，松开熄灭；向前推由常亮状态表示
+  passLatch, // 超车灯向前推 / 复位
   hazard, // 双闪：左右转向同时闪
   cruise, // 定速：开/关
   custom, // 自定义键：请求切信息组
   horn, // 喇叭：瞬时
   turnLeft, // 转向拨杆 ◀
   turnRight, // 转向拨杆 ▶
-  highBeam, // 照明：远/近光
+  highBeam, // 照明：短按远光，长按自动照明
   gearUp, // 加档
   gearDown, // 减档
 }
@@ -38,18 +39,24 @@ class McuState {
     this.leftTurn = false,
     this.rightTurn = false,
     this.highBeam = false,
+    this.autoLamp = false,
+    this.passLight = false,
+    this.passLatched = false,
+    this.ready = false,
     this.cruise = false,
-    this.passFlashUntil = Duration.zero,
   });
 
   final bool hazard;
   final bool leftTurn;
   final bool rightTurn;
   final bool highBeam;
+  final bool autoLamp;
+  final bool passLight;
+  final bool passLatched;
+  final bool ready;
   final bool cruise;
 
-  /// 超车灯按压时刻（用于 UI 闪烁），Duration.zero 表示没在闪。
-  final Duration passFlashUntil;
+  bool get passOn => passLight || passLatched;
 
   /// 仪表顶部转向指示灯的实际状态：双闪时左右同时亮。
   bool get leftLamp => leftTurn || hazard;
@@ -60,16 +67,22 @@ class McuState {
     bool? leftTurn,
     bool? rightTurn,
     bool? highBeam,
+    bool? autoLamp,
+    bool? passLight,
+    bool? passLatched,
+    bool? ready,
     bool? cruise,
-    Duration? passFlashUntil,
   }) {
     return McuState(
       hazard: hazard ?? this.hazard,
       leftTurn: leftTurn ?? this.leftTurn,
       rightTurn: rightTurn ?? this.rightTurn,
       highBeam: highBeam ?? this.highBeam,
+      autoLamp: autoLamp ?? this.autoLamp,
+      passLight: passLight ?? this.passLight,
+      passLatched: passLatched ?? this.passLatched,
+      ready: ready ?? this.ready,
       cruise: cruise ?? this.cruise,
-      passFlashUntil: passFlashUntil ?? this.passFlashUntil,
     );
   }
 
@@ -80,6 +93,8 @@ class McuState {
       if (leftTurn) '左转',
       if (rightTurn) '右转',
       if (highBeam) '远光',
+      if (autoLamp) '自动照明',
+      if (passOn) '超车灯',
       if (cruise) '定速',
     ];
     return on.isEmpty ? '车身功能关闭' : on.join('/');
@@ -99,12 +114,31 @@ class McuPressResult {
 /// 只做"车身功能"，不碰 QEMU 生命周期；Ready 由 `QemuController` 的整车
 /// 状态机处理，因此不在这里。
 class McuSim {
-  McuSim({Duration Function()? now}) : _now = now ?? (() => Duration.zero);
-
-  final Duration Function() _now;
+  McuSim();
   final ValueNotifier<McuState> state = ValueNotifier(const McuState());
 
   void dispose() => state.dispose();
+
+  void setReady(bool ready) {
+    state.value = state.value.copyWith(ready: ready);
+  }
+
+  McuPressResult pressDown(McuKey key) {
+    if (key != McuKey.pass) return press(key);
+    if (state.value.passLight) {
+      return const McuPressResult(['MCU: 超车灯仍按下'], stateChanged: false);
+    }
+    state.value = state.value.copyWith(passLight: true);
+    return const McuPressResult(['MCU: 超车灯 ON（按住期间）']);
+  }
+
+  McuPressResult release(McuKey key) {
+    if (key != McuKey.pass || !state.value.passLight) {
+      return const McuPressResult([], stateChanged: false);
+    }
+    state.value = state.value.copyWith(passLight: false);
+    return const McuPressResult(['MCU: 超车灯 OFF（松开）']);
+  }
 
   /// 按住不放的时长需要被识别（自定义键 = 长按切信息组）。
   McuPressResult press(McuKey key, {bool long = false}) {
@@ -148,15 +182,22 @@ class McuSim {
         return McuPressResult([next ? 'MCU: 右转向 ON' : 'MCU: 右转向 OFF']);
 
       case McuKey.highBeam:
+        if (long) {
+          final next = !s.autoLamp;
+          state.value = s.copyWith(autoLamp: next);
+          return McuPressResult([next ? 'MCU: 自动照明 ON' : 'MCU: 自动照明 OFF']);
+        }
         final next = !s.highBeam;
         state.value = s.copyWith(highBeam: next);
         return McuPressResult([next ? 'MCU: 远光 ON' : 'MCU: 远光 OFF（近光）']);
 
       case McuKey.pass:
-        state.value = s.copyWith(
-          passFlashUntil: _now() + const Duration(milliseconds: 350),
-        );
-        return const McuPressResult(['MCU: 超车灯（闪远光一次）']);
+        return pressDown(key);
+
+      case McuKey.passLatch:
+        final next = !s.passLatched;
+        state.value = s.copyWith(passLatched: next);
+        return McuPressResult([next ? 'MCU: 超车灯向前推 ON' : 'MCU: 超车灯复位 OFF']);
 
       case McuKey.cruise:
         final next = !s.cruise;

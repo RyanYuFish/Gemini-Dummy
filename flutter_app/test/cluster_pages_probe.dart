@@ -74,17 +74,24 @@ void main() {
 
     try {
       await controller.powerOn();
+      expect((await controller.swipeCard()).accepted, isTrue);
+      if (!controller.running.value) {
+        throw StateError('QEMU 未启动: ${controller.lastError.value}\n${logs.join('\n')}');
+      }
       await waitUntil(
-        () => controller.vehicleState.value == VehicleState.locked,
+        () => controller.vehicleState.value == VehicleState.unlocked,
         const Duration(seconds: 170),
       );
-      expect((await controller.swipeCard()).accepted, isTrue);
       // Wait for the animation to actually begin before waiting for its end;
       // checking only `!animating` races the wake-file notification and can
       // mistakenly capture the first boot-logo frame as a settled Launcher.
       await waitUntil(
         () => controller.animating.value,
         const Duration(seconds: 20),
+      );
+      await waitUntil(
+        () => logs.any((line) => line.contains('进入保持/自愈')),
+        const Duration(seconds: 90),
       );
       await waitUntil(
         () => !controller.animating.value,
@@ -109,7 +116,7 @@ void main() {
       // Client state is not evidence that the guest accepted vehicle status.
       controller.bleConnected.value = true;
       controller.tboxOnline.value = true;
-      final ready = await controller.longPressReady();
+      final ready = await controller.pressReady();
       expect(ready.accepted, isTrue);
       expect(controller.vehicleState.value, VehicleState.ready);
       await Future<void>.delayed(const Duration(seconds: 2));

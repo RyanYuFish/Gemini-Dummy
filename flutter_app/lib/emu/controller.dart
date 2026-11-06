@@ -18,6 +18,7 @@ import 'dash_up.dart';
 import 'gd32.dart';
 import 'keys.dart';
 import 'mcu.dart';
+import 'password.dart';
 import 'paths.dart';
 import 'ppm.dart';
 import 'spvd.dart';
@@ -174,7 +175,27 @@ class QemuController {
   final mcu = McuSim();
   final mcuEvents = ValueNotifier<int>(0);
 
-  /// 仪表密码盘状态变更通知（上/下/SET/BACK 改数字时 +1），驱动密码 HUD 重绘。
+  /// MCU 侧开机密码会话（4 位数字与校验都在这里，客户端没有密码界面）。
+  /// 仪表侧的原生界面由 `PasswordUL` 负责，见 emu/password.dart。
+  final mcuPassword = McuPassword();
+
+  /// 开机是否已设置密码。真车由手机 App 写入 MCU；设为 false 表示这台车
+  /// 没设过密码，上电直接点亮。**必须在 pre-arm 上报**：AE5I 的
+  /// `BaseWidget::initWidget()` 只在初始化时读这一位，决定是否把原生
+  /// `PasswordUL` 页建出来（见 docs/EMULATION.md §49.5）。
+  bool get passwordAtBoot => vehicle.passwordConfigured;
+  set passwordAtBoot(bool value) => vehicle.passwordConfigured = value;
+
+  /// 本次上电是否真的要求密码页（`passwordAtBoot` 只是「本车设过密码」）。
+  ///
+  /// 真车规则（用户 2026-11-06 确认）：只有「手把键 / MCU 唤醒」且
+  /// 「手机未连接（仪表蓝牙灯灭）」才弹原生 `PasswordUL`；刷卡、App/TBOX
+  /// 解锁、蓝牙已连手机都直接解锁。固件只在 initWidget 读一次该位，
+  /// 所以必须在 QEMU 启动前算好，不能在运行中改。
+  bool get bootNeedsPassword => vehicle.passwordRequiredThisBoot;
+
+  /// 密码会话状态变更通知（开始 / 结束 / 按键）：驱动画面区切换到
+  /// framebuffer 直显，避免客户端待机占位盖住固件的原生密码界面。
   final pwNotifier = ValueNotifier<int>(0);
 
   /// 仪表画面点亮状态：首帧到达但仍是纯黑时 = false；出现非黑像素后 = true。
@@ -200,6 +221,7 @@ class QemuController {
   /// 唤醒触发文件路径：解锁时创建，模型据此重放开机动画（真车「解锁后仪表点亮」）。
   String? _wakeFile;
   bool _wakeFired = false;
+  final authTransitionBlank = ValueNotifier<bool>(false);
 
   /// 关机动画触发文件路径：下电前创建，模型据此倒放 logo。
   String? _shutdownWakeFile;
@@ -338,17 +360,36 @@ class QemuController {
     // 进入「已解锁」= 真车解锁并启动车辆；此刻仪表才点亮（重放开机动画）。
     if (vehicle.state == VehicleState.unlocked &&
         prev != VehicleState.unlocked) {
-      _fireWake();
+      if (event == VehicleEvent.passwordVerified) {
+        authTransitionBlank.value = true;
+        final session = _sessionDir;
+        Future<void>.delayed(const Duration(milliseconds: 500), () {
+          if (_disposed || !identical(session, _sessionDir) ||
+              vehicle.state != VehicleState.unlocked) {
+            return;
+          }
+          authTransitionBlank.value = false;
+          _fireWake();
+        });
+      } else {
+        _fireWake();
+      }
     }
     // READY = 电机控制器动力就绪：EV_READY 置位、解除驻车，立即上行。
     if (vehicle.state == VehicleState.ready && prev != VehicleState.ready) {
+      mcu.setReady(true);
       telemetry.motor.evReady = 1;
       telemetry.motor.parking = 0;
+      telemetry.gear = 0;
+      unawaited(_dashUp?.gearChanged() ?? Future<void>.value());
       _syncMotor();
     } else if (prev == VehicleState.ready &&
         vehicle.state != VehicleState.ready) {
+      mcu.setReady(false);
       telemetry.motor.evReady = 0;
       telemetry.motor.parking = 1;
+      telemetry.gear = 1;
+      unawaited(_dashUp?.gearChanged() ?? Future<void>.value());
       _syncMotor();
     }
     return d;
@@ -429,42 +470,130 @@ class QemuController {
   // ------------------------------------------------------------ 整车流程入口
 
   /// 上电：启动 QEMU 仪表（真车「整车通电、仪表点亮」）。
-  Future<VehicleDecision> powerOn({String? spvdPath}) =>
-      _apply(VehicleEvent.powerOn, spvdPath: spvdPath);
-
-  /// 刷 NFC 卡：未上电时先上电并在启动后解锁；已解锁/Ready 时关机。
-  Future<VehicleDecision> swipeCard({String? spvdPath}) =>
-      _apply(VehicleEvent.swipeCard, spvdPath: spvdPath);
-
-  /// App 解锁（TBOX 信号）。要求 [tboxOnline]。
-  Future<VehicleDecision> appUnlock({String? spvdPath}) =>
-      _apply(VehicleEvent.appUnlock, spvdPath: spvdPath);
-
-  /// 长按 Ready：未解锁时按连接方式解锁；已解锁进 Ready；Ready 时关机。
-  /// 无连接时长按 Ready 会进入仪表原生密码输入界面（见 [pwUp] 等）。
-  Future<VehicleDecision> longPressReady({String? spvdPath}) =>
-      _apply(VehicleEvent.longPressReady, spvdPath: spvdPath);
-
-  /// 仪表密码输入：上键（当前位数字 +1）。同时把上键真实转发给仪表。
-  Future<VehicleDecision> pwUp() => _pwKey(VehicleEvent.pwUp, '上', 0xd2);
-
-  /// 仪表密码输入：下键（当前位数字 −1）。同时把下键真实转发给仪表。
-  Future<VehicleDecision> pwDown() => _pwKey(VehicleEvent.pwDown, '下', 0xd3);
-
-  /// 仪表密码输入：SET 确认当前位并前进。同时把 SET 真实转发给仪表。
-  Future<VehicleDecision> pwSet() => _pwKey(VehicleEvent.pwSet, 'SET', 0xd4);
-
-  /// 仪表密码输入：BACK 删除上一位。同时把 BACK 真实转发给仪表。
-  Future<VehicleDecision> pwBack() => _pwKey(VehicleEvent.pwBack, 'BACK', 0xd5);
-
-  Future<VehicleDecision> _pwKey(VehicleEvent e, String label, int code) async {
-    final d = _dispatch(e);
-    pwNotifier.value++;
-    _forwardKeyTap(label, code);
+  Future<VehicleDecision> powerOn({String? spvdPath}) async {
+    final d = await _apply(VehicleEvent.powerOn, spvdPath: spvdPath);
+    if (d.accepted) {
+      status.value = '12V 通电 · MCU 待机';
+      _emit(LogKind.mcu, 'MCU: 12V supply on; cluster locked; waiting NFC / Ready / TBOX');
+    }
     return d;
   }
 
-  /// 把密码盘的按键如实转发给仪表（真车上/下/SET/BACK 本就发给仪表）。
+  /// 刷 NFC 卡：未上电时先上电并在启动后解锁；已解锁/Ready 时关机。
+  Future<VehicleDecision> swipeCard({String? spvdPath}) async {
+    final d = await _apply(VehicleEvent.swipeCard, spvdPath: spvdPath);
+    if (d.state == VehicleState.unlocked || vehicle.pendingUnlock) {
+      await _cancelPasswordSession();
+    }
+    return d;
+  }
+
+  /// App 解锁（TBOX 信号）。要求 [tboxOnline]。
+  Future<VehicleDecision> appUnlock({String? spvdPath}) async {
+    final d = await _apply(VehicleEvent.appUnlock, spvdPath: spvdPath);
+    if (d.state == VehicleState.unlocked || vehicle.pendingUnlock) {
+      await _cancelPasswordSession();
+    }
+    return d;
+  }
+
+  /// 长按 Ready：未解锁时按连接方式解锁；已解锁进 Ready；Ready 时关机。
+  /// 无连接时由 MCU 请求仪表显示原生 `PasswordUL` 界面（客户端不画界面）。
+  Future<VehicleDecision> pressReady() => _apply(VehicleEvent.pressReady);
+
+  Future<VehicleDecision> longPressReady({String? spvdPath}) async {
+    final d = await _apply(VehicleEvent.longPressReady, spvdPath: spvdPath);
+    if (d.effect == VehicleEffect.promptPassword) {
+      pwNotifier.value++;
+      await _dashUp?.passwordBegin();
+    } else if (d.state == VehicleState.unlocked) {
+      await _cancelPasswordSession();
+    }
+    return d;
+  }
+
+  Future<void> _cancelPasswordSession() async {
+    if (!vehicle.passwordMode &&
+        !mcuPassword.active &&
+        !vehicle.passwordRequiredThisBoot) {
+      return;
+    }
+    vehicle.passwordMode = false;
+    // 已被其他方式（刷卡 / App / 手机蓝牙）授权，本次上电不再要求密码。
+    vehicle.passwordRequiredThisBoot = false;
+    pwNotifier.value++;
+    await _dashUp?.passwordCancel();
+  }
+
+  /// 密码界面按键：原样透传给仪表（固件 UI 自己渲染），同时喂给 MCU 校验。
+  Future<VehicleDecision> pwUp() =>
+      _pwKey(VehicleEvent.pwUp, '上', 0xD2, PasswordKey.up);
+  Future<VehicleDecision> pwDown() =>
+      _pwKey(VehicleEvent.pwDown, '下', 0xD3, PasswordKey.down);
+  Future<VehicleDecision> pwSet() =>
+      _pwKey(VehicleEvent.pwSet, 'SET', 0xD4, PasswordKey.set);
+  Future<VehicleDecision> pwBack() =>
+      _pwKey(VehicleEvent.pwBack, 'BACK', 0xD5, PasswordKey.back);
+
+  Future<VehicleDecision> _pwKey(
+    VehicleEvent e,
+    String label,
+    int code,
+    PasswordKey key,
+  ) async {
+    final d = _dispatch(e);
+    pwNotifier.value++;
+    _forwardKeyTap(label, code);
+    // 只接收固件提交的密码，客户端不按键镜像校验。
+    return d;
+  }
+
+  /// 密码界面的 4 个键 → CFCP KeyID / 日志名。真车上这些键本来就由 MCU
+  /// 原样转发给仪表，所以长按必须真实保持按下（固件 KeyDelegate 3 s 判定）。
+  static const Map<PasswordKey, (String, int)> _pwKeyMeta = {
+    PasswordKey.up: ('上', 0xD2),
+    PasswordKey.down: ('下', 0xD3),
+    PasswordKey.set: ('SET', 0xD4),
+    PasswordKey.back: ('BACK', 0xD5),
+  };
+
+  /// 密码键**按下**：只发 CFCP 按下帧，不合成抬起 —— 抬起由用户松手决定。
+  Future<void> pwKeyDown(PasswordKey key) async {
+    if (!vehicle.passwordMode && !mcuPassword.active) return;
+    final (label, code) = _pwKeyMeta[key]!;
+    pwNotifier.value++;
+    if (!running.value || _disposed) return;
+    await sendKeyEvent(label, code, true);
+    await _dashUp?.passwordKeyDown(key);
+  }
+
+  /// 密码键**抬起**：只发 CFCP 抬起帧。
+  ///
+  /// ★ 校验**只走固件提交帧**：固件 `PasswordULFB70::VertifyPasswd()` 在收到
+  /// SET 后会自己把 4 位数字通过 `mcucom_tx_power_on_passwd` 发上来，MCU 再
+  /// 回 check_success / tryNumber_error。客户端按键时若同时喂 MCU 镜像，
+  /// 可能在固件置「等待校验」标志之前就先判通过并回 bit4，固件会错过这次
+  /// 应答，页面反而卡住。真车分工就是「界面+输入在仪表，校验在 MCU」。
+  Future<void> pwKeyUp(PasswordKey key) async {
+    if (!vehicle.passwordMode && !mcuPassword.active) return;
+    final (label, code) = _pwKeyMeta[key]!;
+    pwNotifier.value++;
+    if (running.value && !_disposed) {
+      await sendKeyEvent(label, code, false);
+    }
+    // feed=false：只取消 BACK 长按定时器，不喂 MCU 数字镜像。
+    await _dashUp?.passwordKeyUp(key, feed: false);
+  }
+
+  /// 切换「这台车是否设过开机密码」。下一轮上电生效（固件只在 init 时读）。
+  void setPasswordAtBoot(bool v) {
+    passwordAtBoot = v;
+    _emit(LogKind.mcu,
+        v ? 'MCU: 已设置开机密码 → 手把键唤醒且手机未连接时显示原生密码页'
+          : 'MCU: 未设置开机密码 → 上电直接点亮仪表');
+  }
+
+  /// 把密码界面的按键如实转发给仪表（真车上/下/SET/BACK 本就发给仪表）。
   void _forwardKeyTap(String label, int code) {
     if (!running.value || _disposed) return;
     sendKeyEvent(label, code, true);
@@ -494,6 +623,10 @@ class QemuController {
           : '「${k.label}」→ 仪表 $action';
     }
     final fn = k.mcu;
+    if ((fn == McuKey.gearUp || fn == McuKey.gearDown || fn == McuKey.cruise) &&
+        vehicle.state != VehicleState.unlocked && vehicle.state != VehicleState.ready) {
+      return '车辆未解锁，MCU 拒绝行驶指令';
+    }
     if (fn == null) return null;
 
     // ★ 电机控制器模拟：加/减档拨杆切驾驶模式，自定义键切 TCS。
@@ -533,6 +666,21 @@ class QemuController {
     return r.lines.isEmpty ? null : r.lines.last;
   }
 
+  /// GD32 原生保持型按键边沿；目前用于超车灯按下/松开。
+  void mcuKeyDown(InstrumentKey k) => _applyMcuEdge(k, down: true);
+
+  void mcuKeyUp(InstrumentKey k) => _applyMcuEdge(k, down: false);
+
+  void _applyMcuEdge(InstrumentKey k, {required bool down}) {
+    final fn = k.mcu;
+    if (fn == null || !running.value) return;
+    final r = down ? mcu.pressDown(fn) : mcu.release(fn);
+    for (final line in r.lines) {
+      _emit(LogKind.mcu, line);
+    }
+    if (r.stateChanged) _emitMcuState();
+  }
+
   /// 拔电：正常下电之后才允许；仍通电时返回 confirmUnsafeCut 交给 UI 二次确认。
   Future<VehicleDecision> unplugPower() async {
     final d = _dispatch(VehicleEvent.unplug);
@@ -563,7 +711,9 @@ class QemuController {
     bleConnected.value = v;
     _emit(
       LogKind.app,
-      v ? '蓝牙已连接 TBOX：长按 Ready 可解锁' : '蓝牙已断开 TBOX：长按 Ready 转为密码解锁',
+      v
+          ? '蓝牙已连接 TBOX：长按 Ready 可解锁（下次上电不弹密码页）'
+          : '蓝牙已断开 TBOX：若本次上电未授权，长按 Ready 需走原生密码页',
     );
   }
 
@@ -573,9 +723,14 @@ class QemuController {
     _emit(LogKind.app, v ? 'TBOX 在线：App 解锁可用' : 'TBOX 离线：App 解锁不可用');
   }
 
-  void setSimPin(String v) {
-    vehicle.pin = v;
-    _emit(LogKind.app, '仿真解锁密码已更新（演示用，不是原厂密码）');
+  /// 设置 MCU 侧开机密码（真车由手机 App 写入 GD32）。
+  /// 客户端没有任何密码编辑界面，这里只供配置/测试使用。
+  void setMcuPin(String v) {
+    if (!RegExp(r'^\d{4}$').hasMatch(v)) {
+      throw ArgumentError.value(v, 'pin', '开机密码必须为四位数字');
+    }
+    mcuPassword.pin = v;
+    _emit(LogKind.mcu, 'MCU 开机密码已更新（4 位，客户端不显示）');
   }
 
   Future<void> start({String? spvdPath, String? kernelPath}) async {
@@ -586,7 +741,11 @@ class QemuController {
       final d = _dispatch(VehicleEvent.powerOn);
       if (d.effect != VehicleEffect.startGuest) return;
     }
+    if (vehicle.state != VehicleState.booting) return;
     _starting = true;
+    _cfcpRx.clear();
+    _peerProps.clear();
+    _keyQueue = Future.value();
     _forceStopping = false;
     lastError.value = null;
     status.value = '正在上电 · 预检';
@@ -730,7 +889,10 @@ class QemuController {
         _emit(LogKind.app, 'QEMU 退出，code=$code');
         // 正常关机路径已先收到 Power down 并迁到 poweredOff；这里仍在「有电」
         // 说明进程是异常结束的，按等效异常断电记录。
-        if (vehicle.state.isPowered) _dispatch(VehicleEvent.fault);
+        if (vehicle.state != VehicleState.poweredOff &&
+            vehicle.state.isPowered) {
+          _dispatch(VehicleEvent.fault);
+        }
         if (code != 0 && !_forceStopping) {
           lastError.value = 'QEMU 退出码 $code：${errors.toString().trim()}';
         }
@@ -1055,7 +1217,17 @@ class QemuController {
     }
     // 对端推来的属性帧：记进属性表（SoC 侧广播的仪表状态）。
     final msg = cfcpParseProp(frame);
+    if (msg == null && _cfcpTrace && type == kCfcpTypeProp) {
+      _emit(LogKind.mcu, 'CFCP 属性帧解析失败 len=${frame.length} raw=${frame.map((b) => b.toRadixString(16).padLeft(2, '0')).join()}');
+    }
     if (msg != null) {
+      // AE5I PasswordUL 本地校验缓存密码后上报状态；不要把状态帧
+      // 当作包含原始密码的提交。其他格式仍由密码模型谨慎处理。
+      if (msg.prop == DashProp.powerOnPasswd) {
+        _emit(LogKind.mcu, 'CFCP ← 原生密码状态 ${msg.value.length}B '
+            'bits=0x${msg.value.length > 4 ? msg.value[4].toRadixString(16) : "invalid"}');
+        unawaited(_dashUp?.passwordFromFirmware(msg.value) ?? Future.value());
+      }
       _peerProps[msg.prop] = msg.asInt ?? msg.asU16 ?? 0;
       _applyPeerProp(msg.prop, msg.value);
       if (_cfcpTrace) {
@@ -1167,11 +1339,50 @@ class QemuController {
   /// 所有画面元素都由 guest 里原厂 DashTheme01 自己绘制，这里不合成像素。
   void _startDashUp() {
     _stopDashUp();
+    // ★ 本次上电到底要不要密码页（不是「车有没有设密码」）：
+    //   手把键 / MCU 唤醒 且 手机未连接 才要；刷卡、App/TBOX 解锁、
+    //   蓝牙已连手机都不弹密码页。固件只在 initWidget 读一次，所以这里
+    //   必须在 pre-arm 之前定好。
+    final needsPassword = passwordAtBoot &&
+        vehicle.wakeSource == VehicleWakeSource.mcu &&
+        !vehicle.phoneConnected;
+    vehicle.passwordRequiredThisBoot = needsPassword;
+    vehicle.passwordMode = needsPassword;
+    _emit(
+      LogKind.mcu,
+      needsPassword
+          ? 'MCU: 手把键唤醒且手机未连接 → 本次上电要求开机密码（原生 PasswordUL）'
+          : 'MCU: 本次唤醒已授权（${vehicle.wakeSource.name}${vehicle.phoneConnected ? ' + 手机已连接' : ''}）→ 不弹密码页',
+    );
     final feeder = DashUpFeeder(
       send: (f) => _cfcpSend(f),
       paintedPct: () => displayPaintedPct.value,
       animating: () => animating.value,
       telemetry: telemetry,
+      password: mcuPassword,
+      requirePassword: needsPassword,
+      onPasswordVerified: (accepted) {
+        if (accepted) {
+          _dispatch(VehicleEvent.passwordVerified);
+          pwNotifier.value++;
+        } else {
+          _emit(LogKind.mcu, 'MCU: 开机密码校验失败，等待重新输入');
+        }
+      },
+      onPasswordShutdown: () {
+        // 固件原生密码页要求关机（长按 BACK / 右上角倒计时归零）。
+        // 这不是解锁失败，而是正常下电：推进状态机并执行 stopGuest。
+        if (_disposed) return;
+        // 兜底抬起 BACK：长按触发关机时用户可能还按着，避免 CFCP 侧
+        // 留下一个永远按下的键状态。
+        if (running.value) {
+          unawaited(sendKeyEvent('BACK', 0xD5, false));
+        }
+        vehicle.passwordMode = false;
+        pwNotifier.value++;
+        _emit(LogKind.mcu, 'MCU: 密码页请求关机 → 执行正常下电');
+        unawaited(_apply(VehicleEvent.shutdownRequest));
+      },
       onLog: (s) => _emit(LogKind.mcu, s),
       onPhase: (p, _) {
         switch (p) {
@@ -1213,8 +1424,9 @@ class QemuController {
     // GD32 车身状态 → 电机控制器上行状态位（真车也是汇总后经 CFCP 上报）。
     m.turnLeft = s.leftLamp ? 1 : 0;
     m.turnRight = s.rightLamp ? 1 : 0;
-    m.highBeam = s.highBeam ? 1 : 0;
+    m.highBeam = s.passOn ? 1 : 0;
     m.bigLight = s.highBeam ? 1 : 0;
+    m.autoLamp = s.autoLamp ? 1 : 0;
     m.cruiseControl = s.cruise ? 1 : 0;
     // 下行灯态位图帧保留作兼容/日志（集群不消费它，0x21407072 实测 0 px）。
     for (final f in gd32StateFrames(s)) {
@@ -1422,6 +1634,8 @@ class QemuController {
     _shutdownCommandSent = false;
     _mcuTimer?.cancel();
     _stopDashUp();
+    mcuPassword.cancel();
+    authTransitionBlank.value = false;
     _wakeFile = null;
     _wakeFired = false;
     _shutdownWakeFile = null;
@@ -1458,6 +1672,7 @@ class QemuController {
     _mon?.destroy();
     _cfcp?.destroy();
     shutdownAnimating.dispose();
+    authTransitionBlank.dispose();
     motorRevision.dispose();
     clusterState.dispose();
     mcu.dispose();

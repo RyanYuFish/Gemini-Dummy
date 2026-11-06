@@ -27,9 +27,9 @@ MTDPARTS = ("mtdparts=sp_spinand.0:0x40000(nand_header),0x40000(xboot1),"
             "0xc0000(uboot1),0x1c0000(uboot2),0x80000(env),0x80000(env_redund),"
             "0x400000(ecos),0x480000(kernel),0x480000(rootfs.),0x80000(opt.),"
             "0x3000000(spsdk.),0x4040000(spapp.),0x1000000(nvm),0x40000(pq),"
-            "0x40000(tcon),0x40000(iop_car),0x40000(runtime_cfg),0x40000(vi),"
+            "0x40000(tcon),0x40000(iop_car),0x100000(runtime_cfg),0x40000(vi),"
             "0x980000(isp_logo),0x40000(vendordata),0xbc0000(pat_logo),"
-            "0x40000(version_info),0x40000(vd_restore),0x1000000(anm_logo),"
+            "0x40000(version_info),0x40000(vd_restore),0x100000(anm_logo),"
             "0x15540000(userdata)")
 APPEND = " ".join(["console=ttyS0,921600", "loglevel=7", "panic=1", MTDPARTS,
                    "res_chunkmem=0x04000000@0x0C000000",

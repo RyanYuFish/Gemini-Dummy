@@ -68,6 +68,27 @@ void main() {
     expect(sim.state.value.cruise, isTrue);
   });
 
+  test('照明长按切换自动照明，不改变超车灯', () {
+    sim.press(McuKey.highBeam, long: true);
+    expect(sim.state.value.autoLamp, isTrue);
+    expect(sim.state.value.passOn, isFalse);
+    sim.press(McuKey.highBeam, long: true);
+    expect(sim.state.value.autoLamp, isFalse);
+  });
+
+  test('超车灯后拉保持到释放，前推保持到复位', () {
+    sim.pressDown(McuKey.pass);
+    expect(sim.state.value.passOn, isTrue);
+    sim.release(McuKey.pass);
+    expect(sim.state.value.passOn, isFalse);
+    sim.press(McuKey.passLatch);
+    sim.pressDown(McuKey.pass);
+    sim.release(McuKey.pass);
+    expect(sim.state.value.passOn, isTrue);
+    sim.press(McuKey.passLatch);
+    expect(sim.state.value.passOn, isFalse);
+  });
+
   test('加减拨杆不推断三档，改由电控 drive_mode 上报', () {
     final before = sim.state.value;
     for (final key in [McuKey.gearUp, McuKey.gearDown]) {

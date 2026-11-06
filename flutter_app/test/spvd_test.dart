@@ -28,6 +28,20 @@ void main() {
       expect(img.badBlocks, [383, 716, 1049, 1382, 1715]);
       // 真车 cmdlinepart 是 25 个分区（不是早先猜的 10 个）
       expect(img.partitions.length, 25);
+      final mtdEntries = RegExp(r'0x([0-9a-fA-F]+)\(([^)]+)\)')
+          .allMatches(MachineConst.defaultAppend)
+          .map((m) => (m.group(2)!, int.parse(m.group(1)!, radix: 16)))
+          .toList();
+      expect(mtdEntries.length, img.partitions.length);
+      var mtdOffset = 0;
+      for (var i = 0; i < img.partitions.length; i++) {
+        final part = img.partitions[i];
+        expect(mtdEntries[i].$1, part.name, reason: 'MTD[$i] 名称与 SPVD 不同');
+        expect(mtdOffset, part.offset, reason: '${part.name} 起始偏移与 SPVD 不同');
+        expect(mtdEntries[i].$2, part.size, reason: '${part.name} 大小与 SPVD 不同');
+        mtdOffset += mtdEntries[i].$2;
+      }
+      expect(mtdOffset, img.dataSize);
       final kernel = img.partition('kernel');
       expect(kernel, isNotNull);
       expect(kernel!.offset, 0x00800000);

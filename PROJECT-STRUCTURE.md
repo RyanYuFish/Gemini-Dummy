@@ -5,7 +5,7 @@
 | 路径 | 用途 | 处理原则 |
 | --- | --- | --- |
 | `qemu-src/` | 自建 QEMU `sunplus-sp8368` 机器模型和构建树 | 修改模型后运行 `tools/build_model.py` |
-| `flutter_app/` | macOS 仿真器客户端、控制器、SPVD 解析、按键和测试 | 用外部 Flutter SDK 构建（`FLUTTER` 环境变量指定） |
+| `flutter_app/` | macOS 仿真器客户端、控制器、SPVD 解析、按键、密码模块和测试 | 用外部 Flutter SDK 构建（`FLUTTER` 环境变量指定）｜密码 UI 全在固件 Qt，客户端只透传（`lib/emu/password.dart` 管会话/校验，`main.dart` 密码会话期只直显 framebuffer） |
 | `images/` | AE5I/历史对照 SPVD 与原装内核 | 原始验证输入，不覆盖 |
 | `tools/` | SPVD、guest shell、fb/GPU/CFCP 工具 | 脚本输出写入 `dist/` 或 `/tmp` |
 | `tests/` | GPU 2D、CFCP 协议回归 | 修改模型或按键协议后运行 |
@@ -13,6 +13,7 @@
 | `patches/` | guest 启动配置补丁 | 仅作输入材料，不直接替换 `firmware/` |
 | `logs/` | 历史启动日志 | 不作为运行时日志目录 |
 | `firmware/` | 仿真辅助固件片段 | 只读基线，禁止覆盖 |
+| `dist/password-acceptance/` | 原生密码流真实 QEMU 验证截图与串口日志 | 日志含测试密码 `1234`，不外传 |
 
 ## 常用命令
 
@@ -21,8 +22,15 @@ cd Gemini-Dummy
 python3 tools/build_model.py          # 编译模型（macOS 必须用这个脚本）
 bash run_ui.sh                        # 起仿真器（另开终端跑下面的喂食）
 python3 tools/dash_up.py --duration 20 --png /tmp/out.png   # MCU 对端：点亮仪表
+python3 tools/password_probe.py          # 密码属性/门控探针
 python3 tests/test_gpu_2d.py
 python3 tests/test_cfcp_key.py
+
+cd flutter_app                        # 可选：macOS 图形客户端
+export FLUTTER=/path/to/flutter/bin/flutter
+HOME=/tmp FLUTTER_SUPPRESS_ANALYTICS=true "$FLUTTER" test flutter_app/test/native_password_flow.dart   # 真实 QEMU 原生密码流（约 68s）
+HOME=/tmp FLUTTER_SUPPRESS_ANALYTICS=true "$FLUTTER" pub get
+HOME=/tmp FLUTTER_SUPPRESS_ANALYTICS=true "$FLUTTER" build macos --release
 
 cd flutter_app                        # 可选：macOS 图形客户端
 export FLUTTER=/path/to/flutter/bin/flutter
@@ -46,4 +54,4 @@ Flutter SDK **不再内置于本仓库**（原 `Gemini-Dummy/flutter-sdk/` 已�
 
 Release 客户端：`flutter_app/build/macos/Build/Products/Release/ae5i_emu.app`
 
-该包为 universal macOS 应用（`arm64` + `x86_64`，约 40 MB，ad-hoc 签名）。打开后可选择 `dist/qemu-ae5i/ae5i-software.spvd` 或其他有效 SPVD；QEMU 可执行文件仍由 `qemu-src/build/qemu-system-arm` 提供。
+该包为 universal macOS 应用（`arm64` + `x86_64`，约 43 MB，ad-hoc 签名）。打开后选择 `images/ae5i.spvd`（gitignore 但本地存在）或其它有效 SPVD；QEMU 可执行文件仍由 `qemu-src/build/qemu-system-arm` 提供。原生密码流验证截图/串口见 `dist/password-acceptance/`（日志含测试密码 `1234`，不外传）。

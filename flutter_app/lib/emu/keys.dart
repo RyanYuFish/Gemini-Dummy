@@ -73,7 +73,8 @@ class InstrumentKey {
   /// 只有「自定义键」（长按 = 功能码 7 切信息组）和「启动」（长按 Ready）需要；
   /// 其余键都不能因为按住时间变长而动作两次 —— 双闪之类是翻转语义，多触发一次
   /// 就会连开连关。
-  bool get hasLongPress => mcu == McuKey.custom || label == '启动';
+  bool get hasLongPress =>
+      mcu == McuKey.custom || mcu == McuKey.highBeam || label == '启动';
 
   /// 短标签：给按键角标用。
   String get badge {
@@ -92,7 +93,8 @@ class KeyGroup {
 /// 依据：车主现场确认 + `instruction/page79-elec.jpg` 电气原理图。
 const List<KeyGroup> kGroups = [
   KeyGroup('左把手', '10 个实体控件 · 转向拨杆分左右', [
-    InstrumentKey('超车灯', 'Pass', null, mcu: McuKey.pass),
+    InstrumentKey('超车灯', '向后按住', null, mcu: McuKey.pass),
+    InstrumentKey('超车灯常亮', '向前推 / 复位', null, mcu: McuKey.passLatch),
     InstrumentKey('双闪', 'Hazard', null, mcu: McuKey.hazard),
     InstrumentKey('上', 'Up', ClusterKeys.up),
     InstrumentKey('定速', 'Cruise', null, mcu: McuKey.cruise),
@@ -105,7 +107,7 @@ const List<KeyGroup> kGroups = [
     InstrumentKey('喇叭', 'Horn', null, mcu: McuKey.horn),
   ]),
   KeyGroup('右把手', '3 个实体控件 · 档位拨杆分加减', [
-    InstrumentKey('照明', '远 / 近光', null, mcu: McuKey.highBeam),
+    InstrumentKey('照明', '短按远光 · 长按自动', null, mcu: McuKey.highBeam),
     InstrumentKey('加档', 'Gear +', null, mcu: McuKey.gearUp),
     InstrumentKey('减档', 'Gear −', null, mcu: McuKey.gearDown),
     InstrumentKey('启动', 'Ready', null),

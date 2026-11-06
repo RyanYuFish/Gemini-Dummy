@@ -5,14 +5,16 @@
 //   1. 上电后刷卡 = 直接解锁；
 //   2. 蓝牙连上 TBOX 后长按 Ready = 解锁；
 //   3. App 点解锁（TBOX 信号）= 解锁；
-//   4. 以上都没有 → 长按 Ready 提示输密码，密码正确也解锁；
+//   4. 以上都没有 → 长按 Ready，仪表进入**固件原生**密码界面（PasswordUL /
+//      PasswordULFB70），上/下/SET/BACK 由固件自己渲染输入，MCU 侧校验；
 //   5. 停车先刷卡关机 / 长按 Ready 关机，再拔电源；直接拔电源属异常下电，
 //      可能损伤车辆电力系统。
 //
-// 边界（与 EMULATION.md §18 一致）：
-//   仪表固件侧的 MCU/TBOX 认证帧尚未接入，本状态机只驱动客户端与 QEMU
-//   生命周期，**不伪造任何未经确认的车辆总线报文**。所以「解锁」是客户端
-//   仿真层状态，不是固件已认证的证据。
+// 边界（与 EMULATION.md §18、§49 一致）：
+//   本状态机只驱动客户端与 QEMU 生命周期。**密码的数字、校验、以及界面
+//   全部不在客户端**：界面是固件的 Qt 类，校验在 MCU 仿真器
+//   （`emu/password.dart` / `tools/dash_up.py`）。客户端只保留一个
+//   `passwordMode` 标志，用来决定 framebuffer 是否直显（不遮挡固件画面）。
 
 /// 整车状态。前 5 个是「有电」，后 3 个是「没电 / 正在没电」。
 enum VehicleState {
@@ -34,7 +36,7 @@ extension VehicleStateX on VehicleState {
     VehicleState.unlocked => '已解锁',
     VehicleState.ready => 'READY',
     VehicleState.poweringOff => '关机中',
-    VehicleState.poweredOff => '已关机',
+    VehicleState.poweredOff => '12V 通电 · 已锁定',
     VehicleState.unsafeCut => '异常下电',
   };
 
@@ -44,7 +46,8 @@ extension VehicleStateX on VehicleState {
     VehicleState.locked ||
     VehicleState.unlocked ||
     VehicleState.ready ||
-    VehicleState.poweringOff => true,
+    VehicleState.poweringOff ||
+    VehicleState.poweredOff => true,
     _ => false,
   };
 
@@ -72,26 +75,39 @@ extension VehicleStateX on VehicleState {
   /// 主流程条上的位置：断电 › 上电 › 未解锁 › 已解锁 › READY › 关机 › 拔电。
   int get flowIndex => switch (this) {
     VehicleState.off => 0,
-    VehicleState.booting => 1,
+    VehicleState.booting => 2,
     VehicleState.locked => 2,
     VehicleState.unlocked => 3,
     VehicleState.ready => 4,
     VehicleState.poweringOff => 5,
-    VehicleState.poweredOff => 6,
+    VehicleState.poweredOff => 1,
     VehicleState.unsafeCut => 6,
   };
 
   /// 下一步该做什么（UI 提示 + 日志）。
   String get nextStep => switch (this) {
-    VehicleState.off => '先上电；或直接刷卡唤醒（真车刷卡即上电解锁）',
+    VehicleState.off => '先接通实车 12V 电源；断电时刷卡与 Ready 均无效',
     VehicleState.booting => 'MCU 启动 + 仪表就绪中（此阶段仪表黑屏待机属正常，点亮发生在解锁后）',
-    VehicleState.locked => '仪表待机未点亮：刷卡解锁；或蓝牙连 TBOX 后长按 Ready；或 App 解锁；都没有则长按 Ready 输密码。解锁后仪表才点亮',
-    VehicleState.unlocked => '长按 Ready 进入就绪；停车刷卡关机',
+    VehicleState.locked => '仪表待机：刷卡 / 蓝牙连 TBOX 后长按 Ready / App 解锁；手把键唤醒且手机未连时才进固件原生密码界面（4 位，MCU 校验）',
+    VehicleState.unlocked => '短按 Ready 进入前进 READY；长按 Ready 或刷卡关机',
     VehicleState.ready => '停车：刷卡关机或长按 Ready 关机，等仪表断电后再拔电',
     VehicleState.poweringOff => '等 guest 报 Power down；超时可强制拔电',
-    VehicleState.poweredOff => '此时才能拔电（正常下电已完成）',
+    VehicleState.poweredOff => '12V 已通电、仪表已锁定：刷卡直接开机；长按 Ready 按 TBOX 蓝牙钥匙连接情况进入密码页或直接开机',
     VehicleState.unsafeCut => '异常下电已记录；重新上电前建议确认车辆电力系统',
   };
+}
+
+/// 本次上电的唤醒来源。
+///
+/// 真车（用户 2026-11-06 确认）：只有「手把键唤醒（MCU 唤醒）且手机未连接」
+/// 才要求开机密码；刷卡、App/TBOX 解锁、蓝牙已连手机都不弹密码页。
+/// 这个来源决定了 pre-arm 阶段要不要给固件上报 `Power_On_Passwd` 的
+/// go-into-UI 位，所以必须在启动仪表之前就确定。
+enum VehicleWakeSource {
+  none,
+  mcu, // 手把键 / 整车钥匙唤醒（需要判断手机是否连接）
+  nfc, // 刷 NFC 卡
+  app, // App / TBOX 远程解锁
 }
 
 /// 触发状态机的事件。
@@ -100,11 +116,13 @@ enum VehicleEvent {
   bootReady, // 仪表首帧到达（启动完成）
   swipeCard, // 刷 NFC 卡
   appUnlock, // App 点解锁（TBOX 信号）
+  pressReady, // 短按 Ready：已解锁后进入前进 READY
   longPressReady, // 长按 Ready
-  pwUp, // 密码输入：上键（当前位 +1）
-  pwDown, // 密码输入：下键（当前位 −1）
-  pwSet, // 密码输入：SET 确认当前位并前进
-  pwBack, // 密码输入：BACK 删除上一位
+  pwUp, // 密码输入：上键（原样透传给仪表 + MCU 会话）
+  pwDown, // 密码输入：下键（原样透传给仪表 + MCU 会话）
+  pwSet, // 密码输入：SET（原样透传给仪表 + MCU 会话）
+  pwBack, // 密码输入：BACK（原样透传给仪表 + MCU 会话）
+  passwordVerified, // MCU 校验通过：原生密码流程完成，整车解锁
   shutdownRequest, // 客户端「停止 / 下电」
   guestPowerDown, // guest 报 Power down
   unplug, // 拔电
@@ -150,32 +168,39 @@ class VehicleDecision {
 
 /// 纯逻辑状态机：不碰进程、不碰 UI，便于单测。
 class VehicleMachine {
-  VehicleMachine({this.pin = '000000'});
-
-  /// 仿真密码。**不是**原厂密码；仅用于演示「无连接时密码解锁」这条路径。
-  String pin;
+  VehicleMachine();
 
   VehicleState state = VehicleState.off;
 
   /// 蓝牙是否已连上 TBOX（长按 Ready 解锁的前置条件）。
   bool bleConnected = false;
 
+  bool passwordConfigured = true;
+
   /// TBOX 是否在线（App 解锁走 TBOX 信号，不要求蓝牙）。
   bool tboxOnline = false;
 
-  /// 仪表密码输入界面是否激活（仅 locked 状态下有意义）。
-  /// 真车：无 NFC/蓝牙连接时长按 Ready，仪表原生弹出密码输入，
-  /// 由上/下选数字、SET 确认、BACK 删改；此处是客户端对仪表界面的镜像，
-  /// 同时把上/下/SET/BACK 实时转发给仪表。
+  /// 手机是否已连接 = 蓝牙是否连着 TBOX（真车「仪表蓝牙灯」）。
+  ///
+  /// ★ 不能用 `tboxOnline` 代替：TBOX 云端在线只代表 App 通道可用，
+  /// 手机并不一定在附近；手把键唤醒时手机没连 BLE 仍必须要求密码。
+  /// App 远程解锁走独立的 `appUnlock` 事件（要求 `tboxOnline`）。
+  bool get phoneConnected => bleConnected;
+
+  /// 本次上电的唤醒来源（决定是否要求开机密码）。
+  VehicleWakeSource wakeSource = VehicleWakeSource.none;
+
+  /// 本次上电是否要求开机密码（由控制器在启动仪表前按
+  /// `车已设密码 && 唤醒来源 == mcu && 手机未连接` 计算并写入）。
+  ///
+  /// 固件只在 `initWidget()` 读一次 go-into-UI 位，所以这个值一旦启动
+  /// 就不能再改；`passwordMode` 是它在 UI 侧的表现。
+  bool passwordRequiredThisBoot = false;
+
+  /// 是否正在「等待固件原生密码界面」阶段（仅 locked 状态下有意义）。
+  /// 真车：手把键唤醒且手机未连接时，MCU 请求仪表 `PasswordUL` 显示。
+  /// 客户端靠它决定不遮挡 framebuffer；**不保存任何数字/光标/错误次数**。
   bool passwordMode = false;
-
-  /// 已确认的数字（按顺序）。
-  List<int> pwEntered = <int>[];
-
-  /// 当前正在选择的那一位（0–9）。
-  int pwCursor = 0;
-
-  int failedAttempts = 0;
 
   /// 刷卡/App 唤醒时置位：上电完成后直接进「已解锁」，对应真车刷卡即解锁。
   bool _pendingUnlock = false;
@@ -192,6 +217,11 @@ class VehicleMachine {
         return _swipeCard();
       case VehicleEvent.appUnlock:
         return _appUnlock();
+      case VehicleEvent.pressReady:
+        if (state != VehicleState.unlocked) {
+          return _ignore(event, '车辆解锁后才可进入前进 READY');
+        }
+        return _accept(event, VehicleState.ready, VehicleEffect.none, 'Ready 短按 → 前进 READY');
       case VehicleEvent.longPressReady:
         return _ready();
       case VehicleEvent.pwUp:
@@ -202,6 +232,8 @@ class VehicleMachine {
         return _pwSet();
       case VehicleEvent.pwBack:
         return _pwBack();
+      case VehicleEvent.passwordVerified:
+        return _passwordVerified();
       case VehicleEvent.shutdownRequest:
         return _shutdown('客户端下电');
       case VehicleEvent.guestPowerDown:
@@ -221,17 +253,17 @@ class VehicleMachine {
     if (state.isPowered) {
       return _ignore(VehicleEvent.powerOn, '整车已上电（${state.label}）');
     }
-    if (state == VehicleState.poweredOff) {
-      // 仪表关机 ≠ 整车断电：真车必须先拔电源再重新上电。
-      return _ignore(VehicleEvent.powerOn, '仪表已关机但整车仍接电：请先拔电，再重新上电');
-    }
     _pendingUnlock = false;
-    failedAttempts = 0;
+    passwordMode = false;
+    passwordRequiredThisBoot = false;
+    // 手把键 / 整车钥匙唤醒：是否弹密码页要等控制器结合
+    // 「已设密码 + 手机是否连接」再算（passwordRequiredThisBoot）。
+    wakeSource = VehicleWakeSource.none;
     return _accept(
       VehicleEvent.powerOn,
-      VehicleState.booting,
-      VehicleEffect.startGuest,
-      '上电：仪表开始启动',
+      VehicleState.poweredOff,
+      VehicleEffect.none,
+      '12V 系统已通电：MCU 待机，仪表保持锁定；等待刷卡或长按 Ready',
     );
   }
 
@@ -241,7 +273,10 @@ class VehicleMachine {
     }
     final unlock = _pendingUnlock;
     _pendingUnlock = false;
-    failedAttempts = 0;
+    // ★ 不能在这里无条件清 passwordMode：需要密码的本次上电，固件在
+    //   initWidget 阶段就已经把原生 PasswordUL 建出来并画在 framebuffer 上，
+    //   清掉会让客户端用待机占位把密码页盖住。
+    if (unlock) passwordMode = false;
     return unlock
         ? _accept(
             VehicleEvent.bootReady,
@@ -253,23 +288,31 @@ class VehicleMachine {
             VehicleEvent.bootReady,
             VehicleState.locked,
             VehicleEffect.none,
-            '仪表启动完成 → 未解锁，等待刷卡 / Ready / App',
+            passwordMode
+                ? '仪表启动完成 → 固件显示原生密码解锁页，等待输入'
+                : '仪表启动完成 → 未解锁，等待刷卡 / Ready / App',
           );
   }
 
   VehicleDecision _swipeCard() {
     switch (state) {
-      case VehicleState.off:
-        // 真车刷卡本身就是唤醒动作：先上电，启动完成后直接解锁。
+      case VehicleState.poweredOff:
+        // 12V 已通电，刷卡从锁定待机唤醒。
+        // NFC 唤醒不走开机密码，pre-arm 不能上报 go-into-UI。
+        wakeSource = VehicleWakeSource.nfc;
         _pendingUnlock = true;
         return _accept(
           VehicleEvent.swipeCard,
           VehicleState.booting,
           VehicleEffect.startGuest,
-          '刷卡唤醒：上电并在仪表启动后直接解锁',
+          '刷卡解锁：启动仪表与车辆电源，不需要开机密码',
         );
       case VehicleState.booting:
+        // 启动途中刷卡：撤销本次密码要求（固件若已建页，控制器会发
+        // check_passwd_success 让它收掉），启动完成后直接解锁。
         _pendingUnlock = true;
+        passwordRequiredThisBoot = false;
+        passwordMode = false;
         return _ignore(VehicleEvent.swipeCard, '已记录刷卡，仪表启动后自动解锁');
       case VehicleState.locked:
         passwordMode = false;
@@ -289,8 +332,8 @@ class VehicleMachine {
         );
       case VehicleState.poweringOff:
         return _ignore(VehicleEvent.swipeCard, '正在关机，请等待仪表断电');
-      case VehicleState.poweredOff:
-        return _ignore(VehicleEvent.swipeCard, '仪表已关机但整车仍接电：请先拔电，再重新上电');
+      case VehicleState.off:
+        return _ignore(VehicleEvent.swipeCard, '12V 系统未通电，刷卡无效');
       case VehicleState.unsafeCut:
         return _ignore(VehicleEvent.swipeCard, '整车已断电，请先上电');
     }
@@ -304,16 +347,19 @@ class VehicleMachine {
       );
     }
     switch (state) {
-      case VehicleState.off:
+      case VehicleState.poweredOff:
+        wakeSource = VehicleWakeSource.app;
         _pendingUnlock = true;
         return _accept(
           VehicleEvent.appUnlock,
           VehicleState.booting,
           VehicleEffect.startGuest,
-          'App 解锁（TBOX 信号）：唤醒整车上电，启动后直接解锁',
+          'App 解锁（TBOX 信号）：唤醒整车上电，启动后直接解锁（不需要开机密码）',
         );
       case VehicleState.booting:
         _pendingUnlock = true;
+        passwordRequiredThisBoot = false;
+        passwordMode = false;
         return _ignore(VehicleEvent.appUnlock, '已记录 App 解锁，仪表启动后自动解锁');
       case VehicleState.locked:
         passwordMode = false;
@@ -327,7 +373,7 @@ class VehicleMachine {
       case VehicleState.ready:
         return _ignore(VehicleEvent.appUnlock, '车辆已解锁，App 解锁无副作用');
       case VehicleState.poweringOff:
-      case VehicleState.poweredOff:
+      case VehicleState.off:
       case VehicleState.unsafeCut:
         return _ignore(VehicleEvent.appUnlock, '车辆正在/已经下电，App 解锁不适用');
     }
@@ -335,37 +381,52 @@ class VehicleMachine {
 
   VehicleDecision _ready() {
     switch (state) {
+      case VehicleState.poweredOff:
+        wakeSource = VehicleWakeSource.mcu;
+        _pendingUnlock = phoneConnected || !passwordConfigured;
+        passwordMode = !phoneConnected && passwordConfigured;
+        return _accept(
+          VehicleEvent.longPressReady,
+          VehicleState.booting,
+          VehicleEffect.startGuest,
+          phoneConnected
+              ? '长按 Ready：TBOX 蓝牙钥匙已连接，仪表直接开机'
+              : '长按 Ready：手把灯亮，启动仪表原生密码解锁页',
+        );
       case VehicleState.locked:
-        if (bleConnected) {
-          failedAttempts = 0;
+        // 手机已连接（蓝牙连着 TBOX，仪表蓝牙灯亮）→ 直接解锁，不弹密码。
+        if (phoneConnected) {
           return _accept(
             VehicleEvent.longPressReady,
             VehicleState.unlocked,
             VehicleEffect.none,
-            '长按 Ready + 蓝牙已连 TBOX → 解锁',
+            '长按 Ready + 蓝牙已连手机（仪表蓝牙灯亮）→ 解锁（不需要开机密码）',
           );
         }
-        // 无连接：进入仪表原生密码输入界面（上/下/SET/BACK 驱动），
-        // 并把上/下/SET/BACK 实时转发给仪表；不再用客户端弹窗假解锁。
+        // 本次上电本来就没要求密码（刷卡 / App 唤醒，或本车未设密码）：
+        // 固件没有建密码页，不能在这里凭空进入密码会话。
+        if (!passwordRequiredThisBoot) {
+          return _accept(
+            VehicleEvent.longPressReady,
+            VehicleState.unlocked,
+            VehicleEffect.none,
+            '长按 Ready → 解锁（本次上电已在唤醒时授权，无密码页）',
+          );
+        }
+        // 手把键唤醒 + 手机未连接：MCU 请求仪表进入原生 `PasswordUL`。
+        // 上/下/SET/BACK 原样透传给固件，密码状态与校验都在 MCU 仿真器，
+        // 客户端不画界面。
         passwordMode = true;
-        pwEntered = <int>[];
-        pwCursor = 0;
-        failedAttempts = 0;
         return VehicleDecision(
           event: VehicleEvent.longPressReady,
           accepted: false,
           state: state,
-          message: '长按 Ready：无连接，仪表进入密码输入界面（上/下选数字，SET 确认，BACK 删改）',
+          message: '长按 Ready：手机未连接，MCU 请求仪表原生密码界面（PasswordUL）',
           effect: VehicleEffect.promptPassword,
-          hint: '仪表密码输入界面：上/下选数字，SET 确认，BACK 删改；输完与手机 App 密码一致即解锁',
+          hint: '仪表原生密码界面：上/下选数字，SET 确认，BACK 删改；'
+              '长按 BACK 或等待右上角倒计时结束会关机；客户端不绘制任何密码界面',
         );
       case VehicleState.unlocked:
-        return _accept(
-          VehicleEvent.longPressReady,
-          VehicleState.ready,
-          VehicleEffect.none,
-          '长按 Ready → 动力就绪（READY）',
-        );
       case VehicleState.ready:
         return _accept(
           VehicleEvent.longPressReady,
@@ -374,7 +435,6 @@ class VehicleMachine {
           '长按 Ready 关机：等待仪表正常下电（下电完成后才能拔电）',
         );
       case VehicleState.off:
-      case VehicleState.poweredOff:
       case VehicleState.unsafeCut:
         return _ignore(VehicleEvent.longPressReady, '整车未上电，长按 Ready 无效');
       case VehicleState.booting:
@@ -384,58 +444,31 @@ class VehicleMachine {
     }
   }
 
-  // 仪表原生密码输入：上/下选数字、SET 确认、BACK 删改。
-  // 这些事件只在 passwordMode 有效；每次都如实地把上/下/SET/BACK 转给仪表。
-  VehicleDecision _pwUp() {
-    if (!passwordMode) return _ignore(VehicleEvent.pwUp, '当前不在密码输入界面');
-    pwCursor = (pwCursor + 1) % 10;
-    return _ignore(VehicleEvent.pwUp, '密码位 +1 → $pwCursor');
+  // 上/下/SET/BACK 只作为「透传给仪表的原生按键」记录存在。
+  // 数字、光标、错误次数、校验都在 MCU 仿真器（emu/password.dart），
+  // 这里不保存任何可用于绘制界面的状态。
+  VehicleDecision _pwUp() => _pwPass(VehicleEvent.pwUp, '上');
+  VehicleDecision _pwDown() => _pwPass(VehicleEvent.pwDown, '下');
+  VehicleDecision _pwBack() => _pwPass(VehicleEvent.pwBack, 'BACK');
+  VehicleDecision _pwSet() => _pwPass(VehicleEvent.pwSet, 'SET');
+
+  VehicleDecision _pwPass(VehicleEvent event, String label) {
+    if (!passwordMode) return _ignore(event, '当前不在密码输入界面');
+    return _ignore(event, '$label → 原样透传给仪表（界面由固件绘制）');
   }
 
-  VehicleDecision _pwDown() {
-    if (!passwordMode) return _ignore(VehicleEvent.pwDown, '当前不在密码输入界面');
-    pwCursor = (pwCursor + 9) % 10;
-    return _ignore(VehicleEvent.pwDown, '密码位 −1 → $pwCursor');
-  }
-
-  VehicleDecision _pwBack() {
-    if (!passwordMode) return _ignore(VehicleEvent.pwBack, '当前不在密码输入界面');
-    if (pwEntered.isEmpty) {
-      return _ignore(VehicleEvent.pwBack, '已无可见位，无法删除');
+  /// MCU 侧校验通过：才真正把整车推进「已解锁」。
+  VehicleDecision _passwordVerified() {
+    if (!passwordMode ||
+        (state != VehicleState.locked && state != VehicleState.booting)) {
+      return _ignore(VehicleEvent.passwordVerified, '当前不在未解锁状态');
     }
-    pwEntered.removeLast();
-    pwCursor = 0;
-    return _ignore(VehicleEvent.pwBack, '删除上一位，已输入 ${pwEntered.length} 位');
-  }
-
-  VehicleDecision _pwSet() {
-    if (!passwordMode) return _ignore(VehicleEvent.pwSet, '当前不在密码输入界面');
-    pwEntered.add(pwCursor);
-    pwCursor = 0;
-    if (pwEntered.length < pin.length) {
-      return _ignore(VehicleEvent.pwSet, '已输入 ${pwEntered.length}/${pin.length} 位');
-    }
-    if (pwEntered.join() == pin) {
-      passwordMode = false;
-      pwEntered = <int>[];
-      failedAttempts = 0;
-      return _accept(
-        VehicleEvent.pwSet,
-        VehicleState.unlocked,
-        VehicleEffect.none,
-        '密码正确 → 解锁',
-      );
-    }
-    failedAttempts++;
-    pwEntered = <int>[];
-    pwCursor = 0;
-    return VehicleDecision(
-      event: VehicleEvent.pwSet,
-      accepted: false,
-      state: state,
-      message: '密码错误（第 $failedAttempts 次）',
-      effect: VehicleEffect.promptPassword,
-      hint: '密码错误（第 $failedAttempts 次），请重新输入',
+    passwordMode = false;
+    return _accept(
+      VehicleEvent.passwordVerified,
+      VehicleState.unlocked,
+      VehicleEffect.none,
+      '原生密码校验通过 → 解锁',
     );
   }
 
@@ -444,6 +477,7 @@ class VehicleMachine {
       case VehicleState.locked:
       case VehicleState.unlocked:
       case VehicleState.ready:
+        passwordMode = false;
         return _accept(
           VehicleEvent.shutdownRequest,
           VehicleState.poweringOff,
@@ -451,6 +485,7 @@ class VehicleMachine {
           '$source：正常关机，等待仪表下电（下电完成后才能拔电）',
         );
       case VehicleState.booting:
+        passwordMode = false;
         return _accept(
           VehicleEvent.shutdownRequest,
           VehicleState.poweringOff,
@@ -475,7 +510,7 @@ class VehicleMachine {
       VehicleEvent.guestPowerDown,
       VehicleState.poweredOff,
       VehicleEffect.none,
-      '仪表已正常关机（Power down）→ 现在可以拔电',
+      '仪表已锁定关机；12V 系统仍通电，可再次刷卡或长按 Ready 开机',
     );
   }
 
@@ -524,6 +559,7 @@ class VehicleMachine {
     }
     final wasPoweringOff = state == VehicleState.poweringOff;
     _pendingUnlock = false;
+    passwordMode = false;
     return _accept(
       VehicleEvent.forceCut,
       VehicleState.unsafeCut,
@@ -537,11 +573,12 @@ class VehicleMachine {
   VehicleDecision _fault() {
     if (state == VehicleState.booting) {
       _pendingUnlock = false;
+      passwordMode = false;
       return _accept(
         VehicleEvent.fault,
-        VehicleState.off,
+        VehicleState.poweredOff,
         VehicleEffect.none,
-        '上电失败：仪表未能启动',
+        '仪表启动失败：12V 保持通电，可重试开机',
       );
     }
     if (state.isPowered) {
@@ -587,9 +624,8 @@ class VehicleMachine {
     state = VehicleState.off;
     _pendingUnlock = false;
     passwordMode = false;
-    pwEntered = <int>[];
-    pwCursor = 0;
-    failedAttempts = 0;
+    passwordRequiredThisBoot = false;
+    wakeSource = VehicleWakeSource.none;
     bleConnected = false;
     tboxOnline = false;
   }

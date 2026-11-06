@@ -1,6 +1,6 @@
-# Gemini-Dummy · AE5i 仪表仿真技术文档（截至 2026-11-04）
+# Gemini-Dummy · AE5i 仪表仿真技术文档（截至 2026-11-06）
 
-> 最新 AE5I GPU、CFCP/GD32 对端与 P/READY 实测见 §18、§25–§29、§36、§38；当前总路线及 OTA Update 全流程仿真验收见 §37。此前章节保留当时的实验记录。
+> 最新原生密码页与电源状态实测见 §50；GPU、CFCP/GD32 对端与 P/READY 实测见 §18、§25–§29、§36、§38；当前总路线及 OTA Update 全流程仿真验收见 §37。此前章节保留当时的实验记录。
 
 ## 项目最终目标与开发路线
 
@@ -4135,3 +4135,241 @@ guest 内存**；不重绘、不引入外部图像。
 **顶部黑条在现有约束下无法闭环。** 已修好并保留的是：
 `PFC_DOV : get dov failed` 归零（§47）、按 id 分流的真实 DOV 转发（§46）、
 P 档主界面 / 进场动画 / 关机动画 / 底栏数据全部由固件原生渲染（§41–§44）。
+
+---
+
+## 49. 密码解锁：取消客户端自制界面，改为固件原生 UI + MCU 校验（2026-11-05 夜）
+
+用户要求：「将密码解锁改成原生 UI 实现，取消掉自制界面」。此前 §22/§43 记的
+`_passwordPad()` 是 **Flutter 在 framebuffer 上叠的一层自绘 HUD**（橙色格子 +
+数字光标），只是固件 `PasswordUL` 的「客户端镜像」，属于自制界面，已全部删除。
+
+### 49.1 逆向：固件本来就有原生密码界面
+
+| 证据 | 位置 / 结论 |
+|---|---|
+| Qt 类 | `PasswordUL` / `PasswordULFB70` / `PasswordULAE4`、`Ui_PassWordForm`、`ComPassWord` |
+| 工厂 | `ShowPasswordUI(QWidget*)` @`libdashclustoractivity.so:0xce848`：`ConfigWord[0xa]==0x1b` → `PasswordULFB70`（AE5I/FB70），否则 `PasswordULAE4` |
+| 显示链路 | `BaseWidget::slots_password_ui(int)`（`==1` 时才动作）→ `viewShowPasswordUi()` → `vtable+0xc8(6, …)` 切页面索引 6，并置 `this+0x198=6` |
+| 内嵌素材 | `://AE4i/passwordbg.png`、`passwordbgred.png`、`up/down/left/right.png`、`/AE4i/AE4i/密码解锁动画.png`（§39.4 `0x14f810`） |
+| 输入 | `PasswordULFB70::VertifyPasswd(QString)` 要求**长度 4**（`cmp r3,#4`），逐字符取 UTF-16 低字节 |
+| 上行 | `MCUCOMModule::mcucom_tx_power_on_passwd(Power_On_Passwd)` → `CfcpControl::setBytesVehiclePropValue(0x21709701, 0, 6 B)` |
+| 下行 handler | `MCUCOMModule::mcucom_rx_power_on_passwd_handle(vector<uint8_t>)`（长度必须 6） |
+
+**属性 `0x21709701`（Power_On_Passwd，6 B，双向）**
+
+```
+[0..3] 4 位密码（ASCII '0'..'9'）  [4] 状态位  [5] 保留 = 0
+```
+
+`mcucom_rx_power_on_passwd_handle` 用 `checkUint8AndEmitSignalIntWithBit()`
+逐位比较，位变化时才发信号。GOT 重定位（`.rel.dyn` → 信号函数）逐位对上：
+
+| bit | 值 | 信号 / 日志名 |
+|---|---|---|
+| 6 | `0x40` | `MCUCOM_SIGNAL_POWER_ON_PASSWD_GO_INTO_UI` / `power_on_passwd.gointo_passwd_ui` |
+| 5 | `0x20` | `…_SHUTDOWN_NOTIFY` / `shutdown_notify` |
+| 4 | `0x10` | `…_CHECK_PASSWD_SUCCESS` / `check_passwd_success` |
+| 3 | `0x08` | `…_TRYNUMBER_ERROR_LOCK_NOTIFY` / `tryNumber_error_lock_notify` |
+| 7 | `0x80` | `power_on_passwd.verify_status`（仪表→MCU 提交校验请求；tx 只回传 bit3/4/5/7，**丢弃 bit6**） |
+
+真实分工：**界面与输入在仪表（Qt），密码与校验在 MCU（GD32）**。
+`PasswordUL::PowerOn()` → `mcuStart()`（置 bit4 后 `mcucom_tx_power_on_passwd`）→
+隐藏并 `deleteLater()`；`slot_POWER_ON_PASSWD_CHECK_PASSWD(int)` 收到 `==4` 走
+`VertifyFailed()`，否则 `PowerOn()`。
+
+### 49.2 实测：请求帧有效，但当前镜像的 UI 未接线
+
+`tools/password_probe.py` 真机对端实测（QEMU + `images/ae5i.spvd`）：
+
+* 发 `0x21709701` / 6 B / `byte[4]=0x40` 后串口出现
+  `[mcucommodule] i: 6 idx: 6 gointo: 1` —— **帧被正确解析、GO_INTO_UI 信号确实发出**。
+* 但画面非黑比例完全不变（待机页 4.40% / P 档主界面 61.16%），
+  串口无 `slots_password_ui` / `PasswordUL` / `ShowPasswordUI` 任何日志。
+* 扫描 `0x21709700..0x21709704` × `bit ∈ {0x08,0x10,0x20,0x40,0x80,0xC0,0xFF}`、
+  带/不带已设置密码、主界面就绪前后、清 0 再置 1 制造上升沿、上/下/SET/BACK
+  按键，共 35+ 组，全部 0 像素变化。
+* 静态侧也吻合：AE4i 的 spapp 里 `GO_INTO_UI` 只有 `libmcucommodule.so` 定义，
+  **没有任何库引用该信号**（既无 `2MCUCOM_SIGNAL_…_GO_INTO_UI(int)` 老式
+  connect 字符串，也无 dynsym `U` 引用）；`libdashclustoractivity.so` 只 `U` 引用
+  `…_CHECK_PASSWD`。`readPowerOnPasswdFromSys()` 是空函数（`bx lr`）。
+
+⇒ **当前 AE5I 镜像的 Launcher 没有把 GO_INTO_UI 接到 `slots_password_ui`**
+（很可能要求「已在设置页启用开机密码」的系统配置，或该镜像裁剪了这条支路）。
+这与 §48 的 PFC 背景层一样是 guest 侧闭环问题，**不能用客户端重绘去补**。
+
+### 49.3 已实现：客户端零密码界面 + MCU 侧完整协议
+
+* `flutter_app/lib/main.dart`：删除 `_passwordPad()` 自绘 HUD、`_editPin()`
+  密码编辑对话框与「仿真解锁密码」按钮；密码会话期间画面区**只显示
+  `RawImage(frame)`**（不叠状态徽标、提示横幅，也不让 `_clusterStandby()` 遮挡）。
+* `flutter_app/lib/emu/vehicle.dart`：删掉 `pin` / `pwEntered` / `pwCursor` /
+  `failedAttempts`，`pwUp/Down/Set/Back` 退化为「透传记录」；新增
+  `VehicleEvent.passwordVerified`，只有 MCU 回报校验通过才推进 `unlocked`。
+* `flutter_app/lib/emu/password.dart`（新）：`McuPassword` MCU 侧 4 位会话、
+  `PowerOnPasswdBit` 状态位、`verifyFrame()` 处理固件直接提交的 6 B 帧。
+* `flutter_app/lib/emu/dash_up.dart`：`DashProp.powerOnPasswd = 0x21709701`、
+  `dashPowerPasswdFrame()`；`DashUpFeeder.passwordBegin()`（清位→bit6 上升沿）、
+  `passwordKey()`、`passwordFromFirmware()`、`passwordCancel()`，成功发
+  `bit4 + synchronization_status`，失败发 `bit3`。
+* `flutter_app/lib/emu/controller.dart`：上/下/SET/BACK **原样透传**
+  （0xd2/0xd3/0xd4/0xd5）+ 同步喂 `McuPassword`；解析 guest 上行的
+  `0x21709701` 交给 MCU 校验；`onPasswordVerified` 推进整车状态机。
+* `tools/dash_up.py`：`PROP_POWER_ON_PASSWD`、`power_passwd_frame()`、
+  `parse_prop_frame()`、`McuPassword`、`--pin` / `--password-ui`；
+  **默认 19 帧基线逐字节未变**（`dash_up_test.dart` 回归保持）。
+* 验收：`dart analyze lib test tool` 干净；
+  `dart run tool/password_check.dart` → `RESULT PASS · 31 项断言`；
+  Python 侧密码帧/解析/校验自检通过；`test/password_test.dart`、
+  `test/vehicle_test.dart` 已按新链路重写。
+
+### 49.4 尚未闭环 / 下一步
+
+固件 `PasswordUL` 的原生界面在本镜像上仍**没有被唤起**，因此长按 Ready 后
+画面里暂时看不到密码页（也不会再有任何客户端自绘界面）。要真正看到它，
+下一步需要打通 guest 侧启用条件：找到「已设置开机密码」的系统配置
+（`SetupPassWord::saveNewPassword` / `setupDiscPasswordValue` 写入的位置），
+或确认 AE5I spapp 分区里 `libdashclustormodule.so` 的信号连接表
+（spapp squashfs 的 id/fragment 表在本 dump 中损坏，`unsquashfs` 解不开，
+见 §15）。在此之前**禁止**用客户端重绘/离线合成冒充原生界面。
+
+> 2026-11-06 更新：上面的「未唤起」已被 §49.5 的 pre-arm 上报方案解决
+> （`initWidget()` 读 `mcucom_get_power_on_passwd()` 的 bit1）。本节保留
+> 作为当时逆向过程的记录。
+
+### 49.5 唤醒来源门控 + 关机闭环（2026-11-06）
+
+用户实测反馈三个与实车不符的问题，根因与修复如下。
+
+**① 密码页只能在「手把键 / MCU 唤醒 + 手机未连接」时出现**
+
+旧实现把 `passwordAtBoot`（本车是否设过密码）直接当成「每次上电都要密码」，
+所以刷卡、App/TBOX 解锁、蓝牙已连手机的长按 Ready 也都会弹 `PasswordUL`。
+真车规则（用户确认）：
+
+| 唤醒方式 | 手机（蓝牙灯） | 是否弹密码页 |
+|---|---|---|
+| 手把键 / MCU 唤醒 | 未连接（灯灭） | **是** |
+| 手把键 / MCU 唤醒 | 已连接 | 否，直接走正常上电 |
+| 刷 NFC 卡 | 任意 | 否（刷卡即解锁） |
+| App / TBOX 远程解锁 | 任意 | 否 |
+
+实现：`VehicleWakeSource { mcu, nfc, app }` 由状态机在 `powerOn` / `swipeCard` /
+`appUnlock` 时记录；控制器在 QEMU 启动前算
+
+```
+requirePassword = passwordAtBoot &&
+                  wakeSource == mcu &&
+                  !phoneConnected        // 只看 bleConnected（仪表蓝牙灯）
+```
+
+⚠ `tboxOnline` **不能**代替手机连接：TBOX 云端在线只代表 App 通道可用，
+手机不一定在附近。App 远程解锁走独立的 `appUnlock` 事件（要求 tboxOnline）。
+
+并写进 `VehicleMachine.passwordRequiredThisBoot`；`DashUpFeeder` 只在
+`requirePassword` 时于 pre-arm 发 `go-into-UI`（bit6）。固件只在
+`initWidget()` 读一次，**启动后再改无效**，所以必须在这里定。
+
+`bootReady` 不能再无条件清 `passwordMode`：密码页已经由固件画在
+framebuffer 上，清掉会让客户端用待机占位盖住它。
+
+**② 密码通过后才播开机动画**
+
+`_fireWake()`（创建 `SP_WAKE_FILE` → 模型重放 `anm_logo.bin`）只在整车
+进入 `unlocked` 时触发。需要密码的本次上电，`_pendingUnlock=false`，
+`bootReady` 只到 `locked`，所以 logo 不会提前播；`passwordVerified` 后
+才 unlock → wake。密码通过后 `DashUpFeeder` 还会 `_awaitBootAnim()` 等
+`BOOTANIM: guest took`（最多 15 s），再开始 settle/enter，避免固件自己的
+P 档进场动画被 logo 盖住。
+
+**③ 长按 BACK / 右上角倒计时关机**
+
+AE4i 库（与 AE5I 同源，AE5I activity 库未解包）逆向结果：
+
+| 路径 | 证据 |
+|---|---|
+| 长按 BACK | `PasswordUL::clickLongBack()` → `slot_longClick(KeyOpt=3)` → `PasswordUL::shutDown()` |
+| 长按判定 | `KeyDelegate::app_key_press_left()` 起 3000 ms 定时器；10 s 为更长的 `signal_10sClick` |
+| 倒计时 | `MCU_SIGNAL_AUTOMATIC_SHUTDOWN` → `PasswordUL::slot_restartTimeout()`：停 20 s 校验超时，`[+0x20c]` 每 **1000 ms** 递减 `[+0x214]`（10 → 0）；归零 `slot_downCountTimeout()` → `shutDown()` |
+| 关机帧 | `shutDown()` 把 `Power_On_Passwd.byte[4] |= 0x20`（**shutdown_notify，wire bit5**）后 `mcucom_tx_power_on_passwd` |
+
+因此 MCU 侧只做两件事：
+
+1. `McuPassword.verifyFrame()` 收到 **bit5** 立即返回 `shutdown`（不再拿
+   4 位数字去比对密码），控制器走 `VehicleEvent.shutdownRequest` 正常下电。
+2. 按键改成**真实按下/抬起**：`onTapDown` 发 CFCP 按下帧，`onTapUp` 才发
+   抬起帧；不再用 40 ms 合成 tap（合成 tap 永远触发不了固件 3 s 长按）。
+   另加 MCU 侧 3.2 s BACK 兜底定时器，防止固件未透传 bit5。
+
+**禁止**在 MCU 侧另起一份「进页面就开始」的倒计时：固件的倒计时是
+MCU 下发 auto-shutdown 后才开始的 10 步，提前计时会在用户还在输密码时
+误关机。
+
+**其他改动**：客户端按键只透传，不再喂 `McuPassword` 数字镜像 —— 固件
+`PasswordULFB70::VertifyPasswd()` 会自己把 4 位通过 `mcucom_tx_power_on_passwd`
+提交上来。镜像校验可能抢在固件置「等待校验」标志之前回 bit4，导致固件
+错过应答、页面卡住。真车分工就是「输入在 Qt，校验在 MCU」。
+
+验收：`dart analyze lib test tool` 无问题；纯逻辑单测 **76 项全过**；
+`tool/password_check.dart` → `RESULT PASS · 33 项断言`。
+
+### 49.6 现状：代码已落地，真实 QEMU 复测仍报三处未修复（2026-11-06 收尾）
+
+§49.5 的代码改动**已全部落地**于 `flutter_app/lib/emu/*` 与 `tools/dash_up.py`，
+且 `dart analyze` + 纯逻辑单测（76 项）+ `tool/password_check.dart`（33 项）全过，
+新 Release app（00:57 版）也已重编译。
+
+但**这些验收只是纯 Dart 逻辑**，**从未在真实 QEMU 上抓帧 / 抓串口验证过固件实际行为**。
+用户用新 app 复测，反馈三项原始问题**一个都没修好**：
+
+1. 刷卡 / 蓝牙连 TBOX 且 TBOX 在线时长按 Ready / App 解锁 —— 仍进入密码页；
+2. 密码验证通过前就播开机动画；
+3. 密码页里长按 BACK 不关机、右上角倒计时归零也不关机。
+
+这与 §49.2 的逆向结论直接呼应：当前 AE5I 镜像的 Launcher **很可能仍没把
+`GO_INTO_UI` / 长按 BACK / 倒计时 shutdown 接到 `PasswordUL`**。§49.5 只靠
+「pre-arm 上报 bit6」就声称解决，但**没有一条真实证据**表明固件真建页、真回 bit5。
+「代码改完 + Dart 单测过」≠「修好」。
+
+→ 下一步必须抓真实串口日志定性（见项目记忆 2026-11-06.md），再决定是
+「固件不接 ⇒ 等 guest 侧打通」还是「客户端逻辑缝隙 ⇒ 在仿真器侧继续修」。
+**禁止**只跑 Dart 单测就宣称修复。
+
+## 50. 原生密码解锁与 12V 电源分离（2026-11-06）
+
+§49.6 是复测前的历史判断，本节以原装 AE5I 内核与 Launcher 的 QEMU 运行结果更新。实车行为由车主确认：12V 通电与仪表解锁分别控制；锁定时刷卡直接解锁，开机后刷卡关机；TBOX 蓝牙钥匙连接时长按 Ready 直接开机，未连接时长按 Ready 进入密码页；正确密码后先黑屏约 0.5 秒，再播开机动画。解锁后 12V 和 72V 均工作，并可响应行驶指令。
+
+客户端将 12V 上电建模为 `poweredOff`（12V 通电、仪表锁定，QEMU 不启动）；刷卡、App/TBOX 或 Ready 长按唤醒仪表。正常关机后仍保持 12V，可再次唤醒；拔电才进入 `off`。Ready 短按在解锁后进入客户端 READY 状态，长按用于唤醒或关机。TBOX 云端在线与手机连接其蓝牙钥匙是两个独立状态。
+
+### 50.1 原生密码页实证
+
+`flutter_app/test/native_password_flow.dart` 在真实 QEMU 中以 `1234` 作为测试密码，捕获原厂 Qt 页面和串口：`slots_password_ui 1`、`PasswordUL showEvent`、错误输入 `VertifyPasswd "0000"`、按 SET 重新输入、正确输入 `VertifyPasswd "1234"`、`0x21709701` 六字节状态 `byte[4]=0x10`、`check_passwd_success`。固件的错误页要求先按 SET 才能重新输入；忽略该操作会丢失后续第一组输入。截图位于 `dist/password-acceptance/`，串口日志含测试密码，不应作为脱敏日志外传。
+
+静态反汇编及运行记录显示此 AE5I 构建的 `VertifyPasswd` 在 Qt 内比较 MCU 属性缓存中的密码；`mcucom_tx_power_on_passwd` 发送的成功状态前四字节清零。活动密码会话内收到纯 `bit4` 才视为成功，空帧及非活动会话不能解锁。§49.5 关于“固件把输入的四位数字提交给 MCU 校验”的说法不适用于此 AE5I 实测路径。客户端不绘制密码页，输入按键由 CFCP 送至原厂界面；黑屏约 500 ms 和 logo 帧重放属于客户端/机器模型时序，尚非原厂 bootloader 解码器仿真。
+
+真实 QEMU 探针通过：12V 待机、错误密码保持锁定、正确密码解锁并播放 logo、刷卡关机后再次刷卡唤醒、模拟 TBOX 蓝牙钥匙后 Ready 唤醒、再次进入密码页并长按 BACK 触发原生 `shutdown_notify`（`bit5`）及关机、最后拔除 12V。相关状态机、密码、CFCP、MCU 和按键回归共 59 项通过。蓝牙钥匙连接与 NFC 是客户端模拟事件，并非已完成真实无线协议或 NFC 设备仿真。
+
+### 50.2 尚未闭环
+
+- 固件倒计时触发 `shutdown_notify` 的端到端路径仍未验收；当前不声称倒计时已修复。
+- 72V 是解锁行为的目标语义，尚无独立高压电源硬件模型或对应实车协议验证。升降档与 READY 为客户端 MCU 状态模拟和上报，不等于电控真实执行；长按 BACK 倒挡、油门行驶及其原厂报文仍需实现和验证。
+- 开机动画帧重放、PFC 合成、真实蓝牙/Wi-Fi、RS-485 和原厂 OTA 引导/刷写/恢复仍有未完成项；不能以密码路径通过证明全功能仪表仿真完成。
+
+## 51. AE5I MTD 分区表纠正（2026-11-06）
+
+用户验收发现仿真器分区表不正确。审计确认这是**内核启动参数与 SPVD 元数据不一致**，不是 NAND 数据被修改：AE5I SPVD (`images/ae5i.spvd`) 标记 25 项、总长 `0x20000000`；其 `runtime_cfg` 为 `0x09280000 + 0x00100000`，`anm_logo` 为 `0x0A9C0000 + 0x00100000`，`userdata` 从 `0x0AAC0000` 延伸至 `0x20000000`。
+
+错误点：Flutter 主客户端和 `tools/guest_shell.py` 曾把 `runtime_cfg` 缩为 `0x40000`、把 `anm_logo` 扩成 `0x1000000`；`tools/fb_diag.py` 同样错误；`run_ui.sh` 则漏掉 `runtime_cfg` 整项，令后续表项整体前移。上述参数会使 Linux MTD 视图与 SPVD 实际 NAND 逻辑偏移不匹配。
+
+已修正四个 AE5I 启动入口，统一采用 SPVD 的边界。Flutter `spvd_test.dart` 现在解析 `MachineConst.defaultAppend`，逐项核对名称、偏移、大小、连续性和总容量；因此 25 项、偏移与尺寸任何一处漂移都会失败。`tools/mtdparts-150aura.txt` 保留为独立的 150Aura 真机日志记录，不用它替代 AE5I 运行时证据。
+
+验证：修正后通过 `python3 tools/guest_shell.py 'cat /proc/mtd'` 在真实 AE5I guest 启动中读到完整 25 项；顺序、名称和大小与 SPVD 一致（含 `runtime_cfg=0x00100000`、`anm_logo=0x00100000`、`userdata=0x15540000`）。启动日志末尾出现工具本身的 `SIGKILL: Invalid argument` 清理提示，但发生在 `/proc/mtd` 完整返回之后，不影响此项分区验收。Flutter `spvd_test.dart` 也通过逐项对照防止回归。SPVD 原始 NAND 数据及 `firmware/` 均未改写。OTA 全流程仍未实现，未生成任何可刷写包。
+
+## 52. 照明 / 超车灯与 READY 驻车画面（2026-11-06）
+
+实车下一步按 [`docs/69`](../../docs/69-AE5i实车仪表串口日志采集方案.md) 采集完整 ttyS0 启动周期和事件时间线；ttyS0 文本不等于 ttyS1 原始 MCU 报文。
+
+- 用户确认照明开关与超车灯独立，照明长按触发自动照明；超车开关后拉时保持点亮、释放熄灭，前推常亮。客户端分别模拟照明短按、自动照明长按、超车灯后拉和前推/复位，状态由 `McuSim` 保存并经 `indicator_lamp` 上行。长按再次切换自动照明、照明短按的语义及具体灯态字段对应仍是仿真假设，待实车串口比对；电气图不能单独证明 CFCP 编码。
+- READY 时 MCU 状态同步 READY 和解除驻车，并尝试在状态边沿单发 `vehicle_info2.gear=0`；离开 READY 恢复 `gear=1`。不周期重发挡位，避免已知重影。`gear=0` 是实验值，**不代表已确认实车前进挡编码**。
+- 真实 AE5i QEMU 同页对照：固件日志收到 `vehicle_info2.gear: 0`、`indicator_lamp.EV_READY 1` 并执行 `slot_delayUpdateGear`，画面显示 READY，但右侧大 P 仍保留。**P 消失未闭环**；后续须分析原生场景机/绘制和抓取实车 READY 时 MCU 上行，不能用客户端遮罩冒充修复。截图与串口记录在 `dist/qemu-ae5i/pages/`。
+- `cluster_pages_probe.dart` 已适配 12V 待机、刷卡启动与短按 READY 流程。MCU、车辆状态和上行帧 36 项测试通过；真实 QEMU 探针完成，但该探针不以 P 消失作为通过条件。

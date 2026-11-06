@@ -31,6 +31,7 @@ import 'dart:async';
 import 'dart:typed_data';
 
 import 'cfcp.dart';
+import 'password.dart';
 
 /// MCU→SoC 上行属性 id（身份载荷法喂「第 i 字节=i」+ handler 日志回显实测）。
 class DashProp {
@@ -48,6 +49,9 @@ class DashProp {
   static const int lampIn = 0x2170951E; // indicator_lamp (16 B) 上行指示灯
   static const int lamp = 0x21407072;
   static const int gearStatus = 0x21709702;
+  /// Power_On_Passwd（开机密码，6 B）。`mcucom_tx_power_on_passwd` 与
+  /// `mcucom_rx_power_on_passwd_handle` 共用同一个 id，双向语义由 byte[4] 区分。
+  static const int powerOnPasswd = 0x21709701;
   static const int heartbeat = 0x21709521;
   static const int vehStatus = 0x21707701;
   static const int swVersion = 0x21701002;
@@ -344,6 +348,24 @@ Uint8List dashSyncFrame(bool unlock) {
   return dashPropFrame(DashProp.sync, b);
 }
 
+/// Power_On_Passwd (6 B)：[0..3] 4 位密码（ASCII 数字） [4] 状态位 [5] 保留。
+///
+/// 固件 `PasswordULFB70::VertifyPasswd(QString)` 只认长度 4；
+/// `mcucom_tx_power_on_passwd()` 把 byte[4] 的 bit3/4/5/7 原样发回 MCU，
+/// bit6（go into UI）只在 MCU→仪表方向使用。
+Uint8List dashPowerPasswdFrame({
+  int bits = 0,
+  List<int> digits = const [0x30, 0x30, 0x30, 0x30],
+}) {
+  final b = _buf(6);
+  for (var i = 0; i < 4; i++) {
+    b[i] = i < digits.length ? digits[i] & 0xFF : 0x30;
+  }
+  b[4] = bits & 0xFF;
+  b[5] = 0;
+  return dashPropFrame(DashProp.powerOnPasswd, b);
+}
+
 /// trip_total_ODO (24 B)：[0..3] odo [8..11] avg_power（左列平均电耗）。
 Uint8List dashOdoFrame(DashTelemetry t) {
   final b = _buf(24);
@@ -464,8 +486,14 @@ class DashUpFeeder {
     this.onLog = _noopLog,
     this.onPhase = _noopPhase,
     DashTelemetry? telemetry,
+    McuPassword? password,
+    this.onPasswordVerified,
+    this.onPasswordShutdown,
+    this.requirePassword = false,
+    this.passwordTimeout = const Duration(seconds: 120),
     this.preArmTimeout = const Duration(seconds: 25),
-  }) : telemetry = telemetry ?? DashTelemetry();
+  })  : telemetry = telemetry ?? DashTelemetry(),
+        password = password ?? McuPassword();
 
   final DashSend send;
 
@@ -482,6 +510,35 @@ class DashUpFeeder {
   /// MCU 遥测数据源；运行中改字段即刻影响后续心跳上报的数值。
   final DashTelemetry telemetry;
 
+  /// MCU 侧开机密码会话。**没有客户端界面**：数字状态只存在这里，
+  /// 界面由固件 `PasswordUL` 自己画，按键同时原样透传给仪表。
+  final McuPassword password;
+
+  /// MCU 校验结果（true=通过）。控制器据此推进整车状态机。
+  final void Function(bool accepted)? onPasswordVerified;
+
+  /// 固件在原生密码页要求关机（长按 BACK / 倒计时归零）。控制器据此走
+  /// 正常下电流程，**不是**普通解锁失败。
+  final void Function()? onPasswordShutdown;
+
+  /// 本次上电是否要求开机密码。
+  ///
+  /// 真车判定（用户 2026-11-06 确认）：只有「手把键 / MCU 唤醒」且
+  /// 「手机未连接（仪表蓝牙灯灭）」时才需要密码；刷卡、App/TBOX 解锁、
+  /// 蓝牙已连手机都不弹密码页。`controller.passwordAtBoot` 只是「本车
+  /// 设过密码」的配置，真正是否上报 go-into-UI 由本字段决定。
+  ///
+  /// **必须在 pre-arm 阶段就上报**：AE5I 的 `BaseWidget::initWidget()`
+  /// （libcfeasyconnect.so @0x52170）在初始化时读
+  /// `mcucom_get_power_on_passwd()`，返回的 6 B 里 byte[4] bit1 置位就调
+  /// `slots_password_ui(1)` 把原生 `PasswordUL` 建出来；而
+  /// `mcucom_rx_power_on_passwd_handle()` 正是把 payload byte[4] 的 bit6
+  /// 存成这个 bit1。界面起来之后再发就晚了。
+  final bool requirePassword;
+
+  /// 等待用户在固件原生密码页上输入的时间上限。
+  final Duration passwordTimeout;
+
   final Duration preArmTimeout;
 
   static bool _false() => false;
@@ -493,6 +550,26 @@ class DashUpFeeder {
   DashUpPhase _phase = DashUpPhase.idle;
   int _lastRtcMinute = -1;
 
+  /// 固件原生密码页要求关机（长按 BACK / 右上角倒计时归零）。
+  ///
+  /// 两条路径最终都走 `PasswordUL::shutDown()`，把 `Power_On_Passwd` 的
+  /// `byte[4]` shutdown_notify（wire bit5 = 0x20）发给 MCU。倒计时本身由
+  /// 固件自己跑（`MCU_SIGNAL_AUTOMATIC_SHUTDOWN` → 10 步 × 1 s），
+  /// **MCU 侧不能另起一份无条件倒计时**，否则用户还在输密码就会被误关机。
+  bool _passwordShutdown = false;
+
+  /// 本次密码会话已被其他授权方式（刷卡 / App / 手机蓝牙）取消。
+  /// 用于「启动途中刷卡」：状态机已撤销密码要求，feeder 不能再 begin()
+  /// 干等一个永远不会来的密码。
+  bool _passwordCancelled = false;
+
+  Timer? _backLongTimer;
+
+  /// 固件 `KeyDelegate::app_key_press_left()` 的长按判定是 3000 ms；
+  /// 多留 200 ms 余量。即使固件没把 shutdown_notify 透传出来，长按 BACK
+  /// 也能由 MCU 兜底关机。
+  static const Duration _backLongThreshold = Duration(milliseconds: 3200);
+
   DashUpPhase get phase => _phase;
   bool get stopped => _stopped;
 
@@ -503,6 +580,7 @@ class DashUpFeeder {
 
   void stop() {
     _stopped = true;
+    _cancelPasswordTimers();
     _setPhase(DashUpPhase.stopped, 'MCU 对端停止');
   }
 
@@ -519,6 +597,140 @@ class DashUpFeeder {
       dashVi3Frame(telemetry),
       dashBattFrame(telemetry),
     ]);
+  }
+
+  /// 仅在 MCU 挡位状态改变时发送，避免周期重发导致场景重绘。
+  Future<void> gearChanged() async {
+    if (_stopped || !entered) return;
+    await _send(dashVi2Frame(telemetry, gear: telemetry.gear));
+  }
+
+  // ------------------------------------------------------------ 开机密码会话
+  //
+  // 真车分工（§49）：仪表 `PasswordULFB70` 负责原生界面与 4 位输入，
+  // MCU 负责校验。客户端这里只发「请求进入界面」和「校验结果」两类帧，
+  // 绝不绘制或镜像任何密码界面。
+
+  /// 长按 Ready 且无 NFC/蓝牙/App 时，MCU 请求仪表进入原生密码界面。
+  /// 先清一次状态位再置位：`checkUint8AndEmitSignalIntWithBit` 只在位变化时
+  /// 发 `MCUCOM_SIGNAL_POWER_ON_PASSWD_GO_INTO_UI`。
+  Future<void> passwordBegin() async {
+    if (_stopped) return;
+    if (password.active) return;
+    _passwordShutdown = false;
+    _passwordCancelled = false;
+    if (!password.active) password.begin();
+    onLog('DashUp: MCU 开启开机密码会话 → 0x21709701 bit6 请求固件原生 PasswordUL');
+    await _send(dashPowerPasswdFrame());
+    await _sleep(const Duration(milliseconds: 120));
+    await _send(dashPowerPasswdFrame(bits: PowerOnPasswdBit.goIntoUi, digits: password.pin.codeUnits));
+  }
+
+  /// 刷卡 / 蓝牙 / App 解锁或下电时取消会话。
+  ///
+  /// 除了清 bit6，还要发一次 `check_passwd_success`：固件的
+  /// `PasswordUL::PowerOn()` 收到它才会 `hide()` + `deleteLater()`，
+  /// 否则原生密码页会一直留在 framebuffer 上。
+  Future<void> passwordCancel() async {
+    final hadSession = password.active;
+    // 本次上电要求过密码（固件可能已经建好页）就必须发一次 dismiss，
+    // 即使 MCU 会话还没 begin（例如启动途中就刷卡/连上手机）。
+    if (!hadSession && !requirePassword) return;
+    _passwordCancelled = true;
+    password.cancel();
+    _cancelPasswordTimers();
+    onLog('DashUp: MCU 取消开机密码会话（其他方式已授权）');
+    if (_stopped) return;
+    await _send(dashPowerPasswdFrame(bits: PowerOnPasswdBit.checkSuccess));
+    await _sleep(const Duration(milliseconds: 120));
+    await _send(dashPowerPasswdFrame());
+  }
+
+  /// 把手按键（客户端已同时把同一 KeyID 原样透传给仪表）。
+  Future<void> passwordKey(PasswordKey k) async {
+    if (_stopped || _passwordShutdown) return;
+    await _passwordResult(password.key(k));
+  }
+
+  /// 按键**按下**：客户端把 KeyID 原样发给固件后调这里。
+  ///
+  /// 长按 BACK 的判定在固件 `KeyDelegate`（3000 ms），客户端必须真实地
+  /// 保持按下、直到用户松手才发抬起帧，不能再用 40 ms 的合成 tap。
+  /// 这里额外起一个 MCU 侧兜底定时器：即使固件没把 shutdown_notify
+  /// 透传出来，长按 BACK 也能关机。
+  Future<void> passwordKeyDown(PasswordKey k) async {
+    if (_stopped || _passwordShutdown) return;
+    if (k != PasswordKey.back) return;
+    _backLongTimer?.cancel();
+    _backLongTimer = Timer(_backLongThreshold, () {
+      // 密码页可能已经在 pre-arm 阶段画出来，但 `_awaitPassword()` 还没
+      // begin()；只要本次上电要求密码，长按 BACK 就应能关机。
+      if (_stopped || _passwordShutdown) return;
+      if (!password.active && !requirePassword) return;
+      onLog('DashUp: 长按 BACK ≥3.2s → MCU 关机');
+      _shutdownFromPassword('长按 BACK');
+    });
+  }
+
+  /// 按键**抬起**：先取消 BACK 长按定时器，再把短按语义喂给 MCU 会话
+  /// （数字/光标只存在 MCU 侧，界面仍由固件绘制）。
+  Future<void> passwordKeyUp(PasswordKey k, {bool feed = true}) async {
+    if (k == PasswordKey.back) {
+      _backLongTimer?.cancel();
+      _backLongTimer = null;
+    }
+    if (_stopped || _passwordShutdown) return;
+    if (!feed) return; // 手指滑出按键 = 只抬起，不产生短按语义
+    await _passwordResult(password.key(k));
+  }
+
+  void _shutdownFromPassword(String why) {
+    if (_passwordShutdown) return;
+    _passwordShutdown = true;
+    password.cancel();
+    _cancelPasswordTimers();
+    onLog('DashUp: 密码页要求关机（$why）→ 交给控制器走正常下电');
+    onPasswordShutdown?.call();
+  }
+
+  void _cancelPasswordTimers() {
+    _backLongTimer?.cancel();
+    _backLongTimer = null;
+  }
+
+  /// 固件 `PasswordUL` 通过 `mcucom_tx_power_on_passwd` 直接提交密码时，
+  /// 由控制器解析 `0x21709701` 上行帧后交给 MCU 校验。
+  Future<void> passwordFromFirmware(List<int> payload) async {
+    if (_stopped || _passwordShutdown) return;
+    final r = password.verifyFrame(payload);
+    if (r == PasswordResult.pending) return;
+    onLog('DashUp: 收到固件 PasswordUL 密码结果 / 校验请求');
+    await _passwordResult(r);
+  }
+
+  Future<void> _passwordResult(PasswordResult r) async {
+    switch (r) {
+      case PasswordResult.pending:
+        return;
+      case PasswordResult.accepted:
+        _cancelPasswordTimers();
+        await _send(dashPowerPasswdFrame(bits: PowerOnPasswdBit.checkSuccess));
+        await _send(dashSyncFrame(true));
+        onLog('DashUp: 收到密码通过状态 → check_passwd_success + 解锁通知');
+        onPasswordVerified?.call(true);
+        return;
+      case PasswordResult.rejected:
+        await _send(
+            dashPowerPasswdFrame(bits: PowerOnPasswdBit.tryNumberError));
+        await _sleep(const Duration(milliseconds: 120));
+        await _send(dashPowerPasswdFrame()); // 清位，允许下次上升沿
+        onLog('DashUp: MCU 校验失败（第 ${password.failures} 次）');
+        onPasswordVerified?.call(false);
+        return;
+      case PasswordResult.shutdown:
+        _shutdownFromPassword('固件 shutdown_notify');
+        return;
+    }
   }
 
   void _setPhase(DashUpPhase p, String msg) {
@@ -546,7 +758,7 @@ class DashUpFeeder {
       await _preArm();
       if (_stopped) return;
       await _bootUnlock();
-      if (_stopped) return;
+      if (_stopped || _passwordShutdown) return;
       await _burst(20, const Duration(milliseconds: 150), DashUpPhase.settle);
       if (_stopped) return;
       await _enter();
@@ -557,19 +769,30 @@ class DashUpFeeder {
     }
   }
 
-  /// ⓐ pre-arm：App 首帧之前只喂 KL15 + RTC，**禁喂解锁**。
+  /// ⓐ pre-arm：App 首帧之前只喂 KL15 + RTC + 密码存在位，**禁喂解锁**。
   Future<void> _preArm() async {
-    _setPhase(DashUpPhase.preArm,
-        'pre-arm：KL15 + RTC 灌入（不喂解锁，保证进场动画不被拆帧）');
+    _setPhase(
+        DashUpPhase.preArm,
+        requirePassword
+            ? 'pre-arm：KL15 + RTC + 本次上电需要密码（手把键唤醒且手机未连接）'
+            : 'pre-arm：KL15 + RTC 灌入（不喂解锁、不弹密码页，保证进场动画不被拆帧）');
     await _sendAll(dashBootFrames(telemetry));
+    if (requirePassword) {
+      await _send(dashPowerPasswdFrame(bits: PowerOnPasswdBit.goIntoUi, digits: password.pin.codeUnits));
+    }
     await _sleep(const Duration(milliseconds: 250));
     final deadline = DateTime.now().add(preArmTimeout);
     while (!_stopped && DateTime.now().isBefore(deadline)) {
       await _send(dashU32Frame(DashProp.kl15, telemetry.kl15));
       await _send(dashRtcFrame(telemetry));
+      if (requirePassword && !_passwordCancelled) {
+        await _send(dashPowerPasswdFrame(bits: PowerOnPasswdBit.goIntoUi, digits: password.pin.codeUnits));
+      }
       await _sleep(const Duration(milliseconds: 200));
       final p = paintedPct();
-      if (p > 0.03 && !animating()) {
+      // 密码页很暗（≈2.5% 非黑），门槛放低，否则会白等到超时。
+      final threshold = requirePassword ? 0.01 : 0.03;
+      if (p > threshold && !animating()) {
         onLog('DashUp: App 首帧已出现（非黑 ${(p * 100).toStringAsFixed(1)}%）');
         return;
       }
@@ -577,15 +800,82 @@ class DashUpFeeder {
     onLog('DashUp: pre-arm 等待超时，按既定序列继续进场');
   }
 
-  /// ⓑ 基线重放 + ★解锁通知。
+  /// ⓑ 基线重放 + ★解锁通知；设了密码就等用户在固件原生页输完。
   Future<void> _bootUnlock() async {
     _setPhase(DashUpPhase.boot, '重放上电基线（版本/握手/能力/状态/KL15）');
     await _sendAll(dashBootFrames(telemetry));
     await _sleep(const Duration(milliseconds: 350));
+    if (requirePassword) {
+      await _awaitPassword();
+      if (_stopped || _passwordShutdown) return;
+      // ★ 密码通过后才允许播开机动画：控制器在 passwordVerified 时创建
+      //   wake 文件，模型开始重放原厂 logo。这里等 logo 播完再继续
+      //   settle/enter，避免固件的 P 档进场动画被 logo 盖住白播。
+    }
+    await _awaitBootAnim();
+    if (_stopped || _passwordShutdown) return;
     _setPhase(DashUpPhase.unlock,
         '喂 synchronization_status 解锁通知（放行 slot_delayUpdateGear）');
     await _send(dashSyncFrame(true));
     await _sleep(const Duration(milliseconds: 350));
+  }
+
+  /// 已设置密码：等固件 `PasswordUL` 把 4 位密码提交上来，校验通过后
+  /// `_passwordResult` 会发 check_passwd_success + 解锁通知。
+  Future<void> _awaitPassword() async {
+    if (_passwordCancelled) {
+      // 启动途中已刷卡 / App / 手机授权，状态机撤销了密码要求。
+      onLog('DashUp: 密码要求已被其他授权方式取消，跳过等待');
+      return;
+    }
+    _setPhase(DashUpPhase.unlock,
+        '已上报「本次上电需要密码」→ 固件显示原生密码解锁页，等待输入 4 位密码');
+    if (!password.active) password.begin();
+    _passwordShutdown = false;
+    final deadline = DateTime.now().add(passwordTimeout);
+    while (!_stopped &&
+        !_passwordShutdown &&
+        DateTime.now().isBefore(deadline)) {
+      if (!password.active) {
+        onLog('DashUp: 密码校验通过，继续点亮仪表');
+        return;
+      }
+      await _send(dashU32Frame(DashProp.kl15, telemetry.kl15));
+      await _send(dashPowerPasswdFrame(bits: PowerOnPasswdBit.goIntoUi, digits: password.pin.codeUnits));
+      await _sleep(const Duration(milliseconds: 500));
+    }
+    if (_passwordShutdown) return;
+    if (password.active) {
+      // 超时不能「按未验证继续」——那等于绕过密码直接点亮。
+      // 真车没有输入正确密码就不会进主界面，这里按 MCU 超时下电处理。
+      onLog('DashUp: 等待密码超时 → MCU 关机（不允许跳过密码）');
+      _shutdownFromPassword('等待密码超时');
+    }
+  }
+
+  /// 密码通过后等原厂开机 logo 播完。
+  ///
+  /// 模型是「客户端创建 wake 文件 → 重放 anm_logo.bin → BOOTANIM: guest took」。
+  /// 先等它真正开始（最多 3 s），再等它交还 guest（最多 15 s）；没有配置
+  /// 开机动画时 animating 恒为 false，最多多等 3 s。
+  Future<void> _awaitBootAnim() async {
+    final startWait = DateTime.now();
+    while (!_stopped &&
+        !_passwordShutdown &&
+        !animating() &&
+        DateTime.now().difference(startWait) < const Duration(seconds: 3)) {
+      await _sleep(const Duration(milliseconds: 50));
+    }
+    final deadline = DateTime.now().add(const Duration(seconds: 15));
+    while (!_stopped &&
+        !_passwordShutdown &&
+        animating() &&
+        DateTime.now().isBefore(deadline)) {
+      await _sleep(const Duration(milliseconds: 50));
+    }
+    if (!_stopped && !_passwordShutdown) {
+      onLog('DashUp: 开机 logo 已播完，继续 P 档进场序列');
+    }
   }
 
   /// settle：连发 n 拍全量数据，gear 固定 0，不触发场景动画。
@@ -599,9 +889,10 @@ class DashUpFeeder {
 
   /// ⓒ enter：**只写一次** gear，然后耐心等进场动画跑完。
   Future<void> _enter() async {
+    final enteredGear = telemetry.gear;
     _setPhase(DashUpPhase.enter,
-        '只写一次 gear=${telemetry.gear}，触发 PGEAR 进场动画');
-    await _send(dashVi2Frame(telemetry, gear: telemetry.gear));
+        '只写一次 gear=$enteredGear，触发仪表进场动画');
+    await _send(dashVi2Frame(telemetry, gear: enteredGear));
     await _send(dashRtcFrame(telemetry));
     await _sleep(const Duration(milliseconds: 400));
     // 电控状态必须等进场动画跑完再喂（提前喂会让 App 重建场景，把
@@ -611,6 +902,7 @@ class DashUpFeeder {
     await _send(dashLampFrame(telemetry));
     await _sleep(const Duration(milliseconds: 600));
     entered = true;
+    if (telemetry.gear != enteredGear) await gearChanged();
     _setPhase(DashUpPhase.hold, 'P 档主界面由固件自身渲染完成，进入保持/自愈');
   }
 

@@ -7,8 +7,8 @@ LAB=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 QEMU=$LAB/qemu-src/build/qemu-system-arm
 KERNEL=$LAB/images/kernel-ae5i.bin
 SPVD=$LAB/images/ae5i.spvd
-APPEND='console=ttyS0,921600 loglevel=7 panic=1 mtdparts=sp_spinand.0:0x40000(nand_header),0x40000(xboot1),0xc0000(uboot1),0x1c0000(uboot2),0x80000(env),0x80000(env_redund),0x400000(ecos),0x480000(kernel),0x480000(rootfs.),0x80000(opt.),0x3000000(spsdk.),0x4040000(spapp.),0x1000000(nvm),0x40000(pq),0x40000(tcon),0x40000(iop_car),0x40000(vi),0x980000(isp_logo),0x40000(vendordata),0xbc0000(pat_logo),0x40000(version_info),0x40000(vd_restore),0x1000000(anm_logo),0x15540000(userdata) res_chunkmem=0x04000000@0x0C000000 res_fb0=0x00600000@0x0C000000 res_fb1=0x00600000@0x0C600000 res_fb2=0x00600000@0x0CC00000'
-rm -f /tmp/ui-frame.ppm /tmp/ui-qemu.log /tmp/ui-serial.log /tmp/ui-mon.sock
+APPEND='console=ttyS0,921600 loglevel=7 panic=1 mtdparts=sp_spinand.0:0x40000(nand_header),0x40000(xboot1),0xc0000(uboot1),0x1c0000(uboot2),0x80000(env),0x80000(env_redund),0x400000(ecos),0x480000(kernel),0x480000(rootfs.),0x80000(opt.),0x3000000(spsdk.),0x4040000(spapp.),0x1000000(nvm),0x40000(pq),0x40000(tcon),0x40000(iop_car),0x100000(runtime_cfg),0x40000(vi),0x980000(isp_logo),0x40000(vendordata),0xbc0000(pat_logo),0x40000(version_info),0x40000(vd_restore),0x100000(anm_logo),0x15540000(userdata) res_chunkmem=0x04000000@0x0C000000 res_fb0=0x00600000@0x0C000000 res_fb1=0x00600000@0x0C600000 res_fb2=0x00600000@0x0CC00000'
+rm -f /tmp/ui-frame.ppm /tmp/ui-qemu.log /tmp/ui-serial.log /tmp/ui-mon.sock /tmp/ui-console.sock
 export SP_IPC_STUB=1 SP_FB_MULTI=1 SP_FB_COMPOSITE=1
 export SP_FB_FRAME=/tmp/ui-frame.ppm
 # Diagnostics: trace the firmware's own PFC background / DMIX layer programming
@@ -28,7 +28,8 @@ export SP_FB_FRAME=/tmp/ui-frame.ppm
 export SP_PFC_TRACE=1 SP_IPC_MODE=2
 export SP_VDISK=$SPVD SP_VDISK_BASE=0x50000000
 exec "$QEMU" -M sunplus-sp8368 -m 256 -kernel "$KERNEL" -append "$APPEND" \
-  -serial file:/tmp/ui-serial.log \
+  -chardev socket,id=con,path=/tmp/ui-console.sock,server=on,wait=off,logfile=/tmp/ui-serial.log,logappend=on \
+  -serial chardev:con \
   -chardev socket,id=cfcp,host=127.0.0.1,port=9123,server=on,wait=off \
   -serial chardev:cfcp \
   -monitor unix:/tmp/ui-mon.sock,server,nowait \

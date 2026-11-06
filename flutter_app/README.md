@@ -27,7 +27,9 @@ FLUTTER_SUPPRESS_ANALYTICS=true "$FLUTTER" build macos --release
 open build/macos/Build/Products/Release/ae5i_emu.app
 ```
 
-2026-11-05 重建版：`build/macos/Build/Products/Release/ae5i_emu.app`。应用**不再写死任何绝对路径**：从 app 自身位置 / 脚本位置 / 当前目录逐级向上探测仓库根（识别 `qemu-src/`、`tools/`、`flutter_app/`），再据此定位自建 QEMU、SPVD 和原厂动画资源；目录改名或移动仓库都不会再出现「找不到 QEMU」。
+2026-11-06 原生密码解锁验收版：`build/macos/Build/Products/Release/ae5i_emu.app`。先接通「12V 上电」，再刷卡或长按 Ready 开机。未连接模拟 TBOX 蓝牙钥匙时，长按 Ready 进入原厂密码页；默认仿真密码为 `0000`，上/下选数字，SET 确认。输错后按 SET 重新输入。关机后仍有 12V，可再次刷卡；短按 Ready 进入前进 READY，长按 Ready 关机。该版已通过真实 QEMU 密码重试、NFC、模拟蓝牙钥匙和密码页 BACK 长按关机验收；倒计时、倒挡与油门尚未完成验收。
+
+应用从 app 自身位置 / 脚本位置 / 当前目录逐级向上探测仓库根（识别 `qemu-src/`、`tools/`、`flutter_app/`），再据此定位自建 QEMU、SPVD 和原厂动画资源。此构建依赖仓库资源，尚不是可脱离仓库运行的完整独立发行包。
 
 需要本地 Flutter、Xcode、`unsquashfs`、`mksquashfs` 和 `Gemini-Dummy/images/ae5i.spvd`。软件显示镜像仅用于仿真。可用环境变量覆盖：`AE5I_PROJECT_ROOT`（仓库根或其上级工作区）、`AE5I_QEMU_BIN`、`AE5I_SPVD`、`AE5I_BOOT_ANIM`。
 
@@ -48,12 +50,21 @@ open build/macos/Build/Products/Release/ae5i_emu.app
   1. 刷 NFC 卡；
   2. 蓝牙连上 TBOX 后长按「启动」键（Ready）；
   3. TBOX 在线时点「App 解锁」（TBOX 信号）；
-  4. 以上都没有连接时长按 Ready，弹密码框；仿真密码默认 `000000`，可在面板修改（仅客户端演示，不是原厂密码）。
+  4. 以上都没有连接时（手把键 / MCU 唤醒 + 手机蓝牙未连）：MCU 在 pre-arm
+     请求仪表显示**固件原生**密码界面（`PasswordUL` / `PasswordULFB70`），
+     上/下/SET/BACK **真实按下/抬起**原样透传给仪表，4 位密码由固件
+     `VertifyPasswd()` 提交、MCU 仿真器校验。客户端**没有任何密码界面、
+     密码盘或密码编辑框**，密码会话期间画面区只直显 framebuffer。
+     密码通过后才创建 wake 文件播原厂开机 logo；长按 BACK（≥3 s）或
+     密码页倒计时归零时，固件发 `shutdown_notify`（wire bit5），MCU 走
+     正常下电（详见 `docs/EMULATION.md` §49.5）。
+
+> ⚠️ 2026-11-06 状态：上述客户端门控与关机逻辑**代码已实现**，但**真实 QEMU 复测三项仍报未修复**（刷卡/蓝牙长按 Ready 仍进密码页、验证前就播动画、长按 BACK/倒计时不关机）。根因待抓真实串口日志定性（见 §49.6），**禁止只跑 Dart 单测就当修好**。
 - **READY**：已解锁后长按 Ready 进入动力就绪。
 - **正常下电**：已解锁 / READY 时刷卡关机，或 READY 时长按 Ready 关机；等 guest 报 `Power down`，再点「拔电」。
 - **异常下电**：仍通电时点「强制拔电」会先弹风险确认，确认后日志标记「异常下电」。真车直接拔电源可能损伤车辆电力系统，这也是模拟器要提示的顺序。
 
-状态机只驱动客户端与 QEMU 生命周期；画面左上角的解锁状态是客户端 HUD。原厂 `anm_logo/logo.mkv` 帧由 QEMU 模型在解锁时重放。
+状态机只驱动客户端与 QEMU 生命周期；画面左上角的解锁状态是客户端 HUD（进入固件原生密码会话时连 HUD 也隐藏，画面区只保留原厂 framebuffer）。原厂 `anm_logo/logo.mkv` 帧由 QEMU 模型在解锁时重放。
 
 ## 画面点亮链路（MCU 对端）
 

@@ -41,6 +41,12 @@ import struct
 import sys
 import time
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from cfcp_key import key_frame  # noqa: E402
+
+# 仪表按键（CFCP cmd 0x0301 的 key id）：上 / 下 / SET / BACK
+KEY_UP, KEY_DOWN, KEY_SET, KEY_BACK = 0xD2, 0xD3, 0xD4, 0xD5
+
 MAGIC = b"\xfe\x5a\xaa\xa5"
 TAIL = b"\xa5\x55\x5a"
 ACK = bytes([0xFE, 0x5A, 0xAA, 0xA5, 0x90, 0x08, 0x55, 0x01, 0x01, 0x00, 0x00, 0x00, 0x10, 0xA5, 0x55, 0x5A])
@@ -59,6 +65,7 @@ PROP_BATT = 0x21709600       # mcucom_rx_power_battery      (16 B) [0]lvl1 [1]lv
 PROP_LAMP = 0x21407072
 PROP_LAMP_IN = 0x2170951E    # mcucom_rx_indicator_lamp (16 B) 上行指示灯位图
 PROP_GEAR_STATUS = 0x21709702
+PROP_POWER_ON_PASSWD = 0x21709701  # mcucom_(tx|rx)_power_on_passwd (6 B)
 PROP_HEARTBEAT = 0x21709521
 PROP_VEH_STATUS = 0x21707701
 PROP_SWVERSION = 0x21701002
@@ -267,6 +274,128 @@ def trip_frame(prop=PROP_TRIP1, odo_x10=100, avg_power_x10=35, avg_fuel=0,
     return prop_frame(prop, 0, bytes(b))
 
 
+# ------------------------------------------------------------------ 开机密码
+# 逆向结论（docs/EMULATION.md §49）：仪表原生 Qt 类 PasswordUL / PasswordULFB70
+# 负责界面与 4 位输入，MCU 负责校验。两边共用属性 0x21709701 的 6 B 结构：
+#   [0..3] 4 位密码（ASCII 数字）  [4] 状态位  [5] 保留
+# 状态位来自 libmcucommodule.so 的
+# checkUint8AndEmitSignalIntWithBit + GOT 重定位逐位确认：
+#   bit6 0x40 power_on_passwd.gointo_passwd_ui       (MCU→仪表：进入原生界面)
+#   bit4 0x10 power_on_passwd.check_passwd_success   (校验通过)
+#   bit3 0x08 power_on_passwd.tryNumber_error_lock_notify
+#   bit5 0x20 power_on_passwd.shutdown_notify
+#   bit7 0x80 power_on_passwd.verify_status          (仪表→MCU：提交校验)
+class PowerOnPasswdBit:
+    GO_INTO_UI = 0x40
+    CHECK_SUCCESS = 0x10
+    TRYNUMBER_ERROR = 0x08
+    SHUTDOWN_NOTIFY = 0x20
+    VERIFY_STATUS = 0x80
+
+
+def power_passwd_frame(bits=0, digits=b"0000"):
+    """Power_On_Passwd 6 B 属性帧。digits 是 4 个 ASCII 数字。"""
+    b = bytearray(6)
+    b[:4] = (digits + b"0000")[:4]
+    b[4] = bits & 0xFF
+    return prop_frame(PROP_POWER_ON_PASSWD, 0, bytes(b))
+
+
+def parse_prop_frame(frame):
+    """解析一条 CFCP 属性帧 → (prop, sub, payload)，不是属性帧返回 None。"""
+    if len(frame) < 26 or frame[4] != 0x11:
+        return None
+    inner = struct.unpack_from("<H", frame, 12)[0]
+    vlen = inner - 8
+    if vlen < 0 or 22 + vlen > len(frame) - 4:
+        return None
+    return (struct.unpack_from("<I", frame, 14)[0],
+            struct.unpack_from("<I", frame, 18)[0],
+            bytes(frame[22:22 + vlen]))
+
+
+class McuPassword:
+    """MCU 侧开机密码会话（与 flutter_app/lib/emu/password.dart 逐位一致）。
+
+    客户端**不保存任何可绘制的密码界面状态**：界面由固件 PasswordUL 画，
+    按键原样透传给仪表，这里只做 MCU 侧的会话与校验。
+    """
+
+    PIN_LENGTH = 4  # PasswordULFB70::VertifyPasswd 只接受长度 4 的 QString
+
+    def __init__(self, pin="0000"):
+        self.pin = pin
+        self.active = False
+        self.digits = []
+        self.cursor = 0
+        self.failures = 0
+
+    def begin(self):
+        self.active = True
+        self.digits = []
+        self.cursor = 0
+
+    def cancel(self):
+        self.active = False
+        self.digits = []
+        self.cursor = 0
+
+    def key(self, which):
+        """which ∈ {up,down,set,back} → pending / accepted / rejected。"""
+        if not self.active:
+            return "pending"
+        if which == "up":
+            self.cursor = (self.cursor + 1) % 10
+        elif which == "down":
+            self.cursor = (self.cursor + 9) % 10
+        elif which == "back":
+            if self.digits:
+                self.digits.pop()
+                self.cursor = 0
+        elif which == "set":
+            self.digits.append(self.cursor)
+            self.cursor = 0
+            if len(self.digits) < self.PIN_LENGTH:
+                return "pending"
+            return self._check("".join(str(d) for d in self.digits))
+        return "pending"
+
+    def verify_frame(self, payload):
+        """固件 mcucom_tx_power_on_passwd 直接提交 4 位密码时的校验。"""
+        if len(payload) != 6:
+            return "pending"
+        # 关机通知优先：PasswordUL::shutDown()（长按 BACK 3 s / 右上角
+        # 倒计时 10 步 × 1 s 归零）把 byte[4] |= 0x20 发上来，此时 4 位
+        # 数字无意义，不能拿去比对密码。
+        if self.active and (payload[4] & PowerOnPasswdBit.SHUTDOWN_NOTIFY):
+            self.cancel()
+            return "shutdown"
+        if not self.active:
+            return "pending"
+        # AE5I Qt compares its cached password locally, then reports success
+        # with zero digits and wire bit4. Only an active session may accept it.
+        if payload[:4] == bytes(4) and payload[4] == PowerOnPasswdBit.CHECK_SUCCESS:
+            self.failures = 0
+            self.cancel()
+            return "accepted"
+        if payload[4] & PowerOnPasswdBit.GO_INTO_UI:
+            return "pending"  # 这是 MCU→仪表方向的请求，不是提交
+        chars = payload[:4]
+        if not all(0x30 <= c <= 0x39 for c in chars):
+            return "pending"
+        return self._check("".join(chr(c) for c in chars))
+
+    def _check(self, entered):
+        self.digits = []
+        self.cursor = 0
+        if entered == self.pin:
+            self.failures = 0
+            self.active = False
+            return "accepted"
+        self.failures += 1
+        return "rejected"
+
+
 def boot_sequence(kl15=0x99):
     """模拟上电：版本握手 + 能力 + 状态 + 心跳 + KL15。"""
     return [
@@ -284,12 +413,15 @@ def boot_sequence(kl15=0x99):
 class Peer:
     """ACK 每一帧并周期喂数据的最小 CFCP 对端。"""
 
-    def __init__(self, host, port):
+    def __init__(self, host, port, on_prop=None):
         self.s = socket.create_connection((host, port), timeout=5)
         self.s.setblocking(False)
         self.buf = b""
         self.acks = 0
         self.rxbytes = 0
+        # 可选：guest→MCU 的属性帧回调 (prop, sub, payload)。
+        # 默认 None，保证既有「只计数 + 回 ACK」的行为不变。
+        self.on_prop = on_prop
 
     def pump(self):
         """收包 + 逐帧回 ACK。返回本次收到的完整帧数。"""
@@ -313,8 +445,13 @@ class Peer:
             if j < 0:
                 self.buf = self.buf[i:]
                 break
+            frame = self.buf[i:j + 3]
             self.buf = self.buf[j + 3:]
             n += 1
+            if self.on_prop is not None:
+                parsed = parse_prop_frame(frame)
+                if parsed is not None:
+                    self.on_prop(*parsed)
         if n:
             try:
                 self.s.sendall(ACK * n)
@@ -357,6 +494,25 @@ def frame_stats():
     return w, h, 100.0 * nb / n, 100.0 * teal / n
 
 
+def send_password_result(peer, pw, result, quiet=False):
+    """MCU 校验结果 → 回给仪表（原生 PasswordUL 的状态位）。"""
+    if result == "accepted":
+        peer.send(power_passwd_frame(PowerOnPasswdBit.CHECK_SUCCESS))
+        peer.send(sync_frame(True))
+        if not quiet:
+            print("[pw] MCU 校验通过 → check_passwd_success + 解锁通知")
+    elif result == "rejected":
+        peer.send(power_passwd_frame(PowerOnPasswdBit.TRYNUMBER_ERROR))
+        time.sleep(0.12)
+        peer.send(power_passwd_frame())  # 清位，允许下一次上升沿
+        if not quiet:
+            print(f"[pw] MCU 校验失败（第 {pw.failures} 次）")
+    elif result == "shutdown":
+        # 工具只负责 MCU 对端；真正的下电由仿真客户端执行。
+        if not quiet:
+            print("[pw] 固件要求关机（长按 BACK / 倒计时归零）→ MCU 应执行正常下电")
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--host', default='127.0.0.1')
@@ -383,6 +539,18 @@ def main():
                     help='电机控制器上报的 TCS 状态：1=启用 2=关闭（默认 1）')
     ap.add_argument('--no-motor', action='store_true',
                     help='对照组：不喂电机控制器状态帧（2026-11-05 之前的旧行为）')
+    ap.add_argument('--pin', default='0000',
+                    help='MCU 侧开机密码（4 位；真车由手机 App 写入 GD32）')
+    ap.add_argument('--password-ui', dest='password_ui', action='store_true',
+                    default=False,
+                    help='开机上报「已设置开机密码」→ 固件原生 PasswordUL 在 initWidget '
+                         '时自己弹出（默认关；只有在手把键唤醒且手机未连接的真车场景才需要）')
+    ap.add_argument('--no-password-ui', dest='password_ui', action='store_false',
+                    help='不报密码存在位（默认），直接进 P 档主界面')
+    ap.add_argument('--password-timeout', type=float, default=120.0,
+                    help='等待固件提交密码的秒数')
+    ap.add_argument('--auto-pin', action='store_true',
+                    help='仿真便利：进入密码页后自动用上/SET 键输入 --pin（无人在场时自检用）')
     ap.add_argument('--odo', type=int, default=5060, help='总里程，0.1 km 单位')
     ap.add_argument('--avg-power', type=int, default=287, help='平均电耗，0.1 Wh/km')
     ap.add_argument('--trip', type=int, default=100, help='单次里程，0.1 km 单位')
@@ -394,10 +562,24 @@ def main():
     ap.add_argument('--png', default=None)
     args = ap.parse_args()
 
+    pw = McuPassword(args.pin)
     try:
         p = Peer(args.host, args.port)
     except OSError as e:
         sys.exit(f"连不上 {args.host}:{args.port}（仿真器没起来？）：{e}")
+
+    # 固件 PasswordUL 提交 4 位密码时，由 MCU 侧校验并回状态位。
+    def on_pw_prop(prop, sub, payload):
+        if prop != PROP_POWER_ON_PASSWD:
+            return
+        result = pw.verify_frame(payload)
+        if result == "pending":
+            return
+        if not args.quiet:
+            print("[pw] 收到固件 PasswordUL 提交的密码，MCU 校验")
+        send_password_result(p, pw, result, args.quiet)
+
+    p.on_prop = on_pw_prop
 
     # RTC：默认跟随宿主机本地时间（= MCU 上报的真实时钟），不再固定 12:00。
     # 只在「分钟变化」时重发，避免频繁跳变扰动 App 的定时/彩蛋逻辑。
@@ -427,23 +609,38 @@ def main():
             sys.exit('--rtc 需要 6 个数：yy,mm,dd,hh,mi,ss，或 auto')
         rtc_frame = prop_frame(PROP_RTC, 0, bytes(v & 0xFF for v in parts))
 
-    # ★ Phase 0「pre-arm」：趁 App 还没画第一屏，先把 KL15 / 解锁 / RTC 灌进去。
+    # ★ Phase 0「pre-arm」：趁 App 还没画第一屏，先把 KL15 / RTC 灌进去。
     #   原因：时钟 item 首帧会用 App 自己的 12:00 画一遍，之后我们再把时间改掉时，
     #   它只重画自己新文本的矩形，旧字右侧（"12:00" 的尾巴）会留下残影
     #   （显示成 "3:2t00"）。在首帧之前就把正确时间塞进去，就不会有这一层残影。
+    #
+    #   ★★ 开机密码也必须在 pre-arm 里报：AE5I 的
+    #   BaseWidget::initWidget()（libcfeasyconnect.so @0x52170）在**初始化时**
+    #   读 mcucom_get_power_on_passwd()，只要返回的 6 B 里 byte[4] bit1 置位，
+    #   就调 slots_password_ui(1) 把原生 PasswordUL 页建出来。而
+    #   mcucom_rx_power_on_passwd_handle() 正是把 payload byte[4] 的 bit6
+    #   存成那个 bit1。所以这一帧必须在界面初始化之前到达 —— 界面起来之后再发
+    #   就太晚了（之前所有"发 bit6 没反应"的测试都是这个原因）。
+    pw_bits = PowerOnPasswdBit.GO_INTO_UI if args.password_ui else 0
     t_pre = time.time()
+
     for f in boot_sequence(args.kl15):
         p.send(f)
+    if args.password_ui:
+        p.send(power_passwd_frame(pw_bits))
     time.sleep(0.25)
     p.pump()
     while time.time() - t_pre < 25.0:
         st = frame_stats()
-        if st and st[2] > 3.0:      # App 已经画出第一屏，pre-arm 结束
-            break
+        # 有密码页时首屏很暗（≈2.5% 非黑），门槛要放低，否则会白等到超时。
+        if st and st[2] > (1.0 if args.password_ui else 3.0):
+            break                     # App 已经画出第一屏，pre-arm 结束
         p.pump()
         p.send(prop_u32(PROP_KL15, args.kl15))
         if rtc_frame is not None:
             p.send(rtc_frame)
+        if args.password_ui:
+            p.send(power_passwd_frame(pw_bits))
         time.sleep(0.2)
     p.pump()
 
@@ -452,10 +649,55 @@ def main():
     time.sleep(0.35)
     p.pump()
 
-    if not args.no_unlock:
+    # ★ 已设置密码时：先不电解锁通知，等用户在固件原生 PasswordUL 上输入并被
+    #   MCU 校验通过；只有真车流程走完才放行 slot_delayUpdateGear 进主界面。
+    if args.password_ui:
+        pw.begin()
+        if not args.quiet:
+            print(f"[pw] 已上报「密码已设置」→ 固件应显示原生密码解锁页；"
+                  f"等待固件提交 4 位密码（{args.password_timeout:.0f}s 超时）")
+        deadline = time.time() + args.password_timeout
+        if args.auto_pin:
+            # 模拟用户按键：上键把当前位加到目标数字，再按 SET 确认下一位。
+            time.sleep(1.5)
+            p.pump()
+            for ch in args.pin[:McuPassword.PIN_LENGTH]:
+                for _ in range(int(ch)):
+                    p.send(key_frame(KEY_UP, True))
+                    time.sleep(0.05)
+                    p.send(key_frame(KEY_UP, False))
+                    time.sleep(0.12)
+                p.send(key_frame(KEY_SET, True))
+                time.sleep(0.05)
+                p.send(key_frame(KEY_SET, False))
+                time.sleep(0.25)
+                p.pump()
+            if not args.quiet:
+                print(f"[pw] 已用按键输入 {args.pin}")
+        while time.time() < deadline:
+            p.pump()
+            if not pw.active:            # 校验通过后 on_pw_prop 会把会话关掉
+                break
+            p.send(prop_u32(PROP_KL15, args.kl15))
+            p.send(power_passwd_frame(pw_bits))   # 保持「已设置」位
+            if rtc_frame is not None:
+                p.send(rtc_frame)
+            time.sleep(0.5)
+        p.pump()
+        if pw.active:
+            pw.cancel()
+            if not args.quiet:
+                print("[pw] 等待超时，按未验证继续（仅仿真便利）")
+            if not args.no_unlock:
+                p.send(sync_frame(True))
+        elif not args.no_unlock:
+            p.send(sync_frame(True))       # 校验通过：此帧由 send_password_result 已发
+        time.sleep(0.35)
+        p.pump()
+    elif not args.no_unlock:
         p.send(sync_frame(True))          # ★ 解锁通知：放行 slot_delayUpdateGear
-    time.sleep(0.35)
-    p.pump()
+        time.sleep(0.35)
+        p.pump()
 
     # ★ 两段式进场（实测出来的唯一稳妥顺序）
     #   Phase 1「settle」：连发 20 拍把数据推到位，**挡位保持 0（不进 P 档）**，
